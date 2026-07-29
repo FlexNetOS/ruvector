@@ -37,6 +37,14 @@ ui/**/adapter-node/
 *.node
 index.js
 index.d.ts
+# @ruvector/sona ships committed JS bindings: CI's napi CLI version drifts
+# (v3 emits no v2-style loader), which published an empty 0.1.6 (#516)
+!npm/packages/sona/index.js
+!npm/packages/sona/index.d.ts
+# ruvector optimizer is a hand-written module (not a napi artifact); the bare
+# `index.js` rule above wrongly ignored it, so it was never committed and CI's
+# optimizer test could not resolve it.
+!npm/packages/ruvector/src/optimizer/index.js
 
 # Environment variables and secrets
 .env
@@ -123,6 +131,9 @@ hive-mind-prompt-*.txt
 logs/
 data/
 
+# PhotonLayer MNIST cache (public dataset, fetched at bench time, never committed)
+crates/photonlayer-bench/data/
+
 # Large model files
 *.gguf
 test_models/*.gguf
@@ -182,3 +193,4 @@ crates/ruvector-hailo/Cargo.lock
 crates/ruvector-hailo-cluster/Cargo.lock
 crates/hailort-sys/Cargo.lock
 crates/ruvector-mmwave/Cargo.lock
+node_modules

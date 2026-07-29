@@ -64,6 +64,7 @@
     "@ruvector/rvf": "^0.2.1",
     "@ruvector/rvf-wasm": "^0.1.6",
     "agentdb": "^3.0.0-alpha.14",
+    "hnswlib-node": "^3.0.0",
     "ruvector-core-linux-x64-gnu": "^0.1.29"
   },
   "devDependencies": {

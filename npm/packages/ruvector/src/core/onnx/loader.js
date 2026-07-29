@@ -9,6 +9,9 @@
  */
 export const MODELS = {
     // Sentence Transformers - Small & Fast
+    // prefixPolicy / queryPrefix / passagePrefix (ADR-210 D4) encode each
+    // model card's query/passage convention: 'none' | 'required' |
+    // 'query-recommended'. MiniLM models take NO prefixes.
     'all-MiniLM-L6-v2': {
         name: 'all-MiniLM-L6-v2',
         dimension: 384,
@@ -17,6 +20,9 @@ export const MODELS = {
         description: 'Fast, general-purpose embeddings',
         model: 'https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx',
         tokenizer: 'https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json',
+        prefixPolicy: 'none',
+        queryPrefix: '',
+        passagePrefix: '',
     },
     'all-MiniLM-L12-v2': {
         name: 'all-MiniLM-L12-v2',
@@ -26,9 +32,13 @@ export const MODELS = {
         description: 'Better quality, balanced speed',
         model: 'https://huggingface.co/sentence-transformers/all-MiniLM-L12-v2/resolve/main/onnx/model.onnx',
         tokenizer: 'https://huggingface.co/sentence-transformers/all-MiniLM-L12-v2/resolve/main/tokenizer.json',
+        prefixPolicy: 'none',
+        queryPrefix: '',
+        passagePrefix: '',
     },
 
-    // BGE Models - State of the art
+    // BGE Models - State of the art. Query instruction recommended for
+    // short-query → long-passage retrieval; passages need no instruction.
     'bge-small-en-v1.5': {
         name: 'bge-small-en-v1.5',
         dimension: 384,
@@ -37,6 +47,9 @@ export const MODELS = {
         description: 'State-of-the-art small model',
         model: 'https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx',
         tokenizer: 'https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json',
+        prefixPolicy: 'query-recommended',
+        queryPrefix: 'Represent this sentence for searching relevant passages: ',
+        passagePrefix: '',
     },
     'bge-base-en-v1.5': {
         name: 'bge-base-en-v1.5',
@@ -46,9 +59,13 @@ export const MODELS = {
         description: 'Best overall quality',
         model: 'https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/onnx/model.onnx',
         tokenizer: 'https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/tokenizer.json',
+        prefixPolicy: 'query-recommended',
+        queryPrefix: 'Represent this sentence for searching relevant passages: ',
+        passagePrefix: '',
     },
 
-    // E5 Models - Microsoft
+    // E5 Models - Microsoft. The model card REQUIRES 'query: '/'passage: '
+    // prefixes; quality degrades without them.
     'e5-small-v2': {
         name: 'e5-small-v2',
         dimension: 384,
@@ -57,9 +74,12 @@ export const MODELS = {
         description: 'Excellent for search & retrieval',
         model: 'https://huggingface.co/intfloat/e5-small-v2/resolve/main/onnx/model.onnx',
         tokenizer: 'https://huggingface.co/intfloat/e5-small-v2/resolve/main/tokenizer.json',
+        prefixPolicy: 'required',
+        queryPrefix: 'query: ',
+        passagePrefix: 'passage: ',
     },
 
-    // GTE Models - Alibaba
+    // GTE Models - Alibaba (no prefixes documented)
     'gte-small': {
         name: 'gte-small',
         dimension: 384,
@@ -68,6 +88,9 @@ export const MODELS = {
         description: 'Good multilingual support',
         model: 'https://huggingface.co/thenlper/gte-small/resolve/main/onnx/model.onnx',
         tokenizer: 'https://huggingface.co/thenlper/gte-small/resolve/main/tokenizer.json',
+        prefixPolicy: 'none',
+        queryPrefix: '',
+        passagePrefix: '',
     },
 };
 
@@ -75,6 +98,14 @@ export const MODELS = {
  * Default model for quick start
  */
 export const DEFAULT_MODEL = 'all-MiniLM-L6-v2';
+
+/**
+ * In-memory memo of loaded models, keyed by model name. Deduplicates the
+ * (re-)download + decode when multiple embedder instances load the same model
+ * in one process. In Node there is no Cache API, so without this every
+ * ModelLoader.loadModel() re-fetches the model from HuggingFace (issue #523).
+ */
+const _inMemoryModelCache = new Map();
 
 /**
  * Model loader with caching support
@@ -92,23 +123,105 @@ export class ModelLoader {
      * @returns {Promise<{modelBytes: Uint8Array, tokenizerJson: string, config: object}>}
      */
     async loadModel(modelName = DEFAULT_MODEL) {
-        const modelConfig = MODELS[modelName];
+        // Own-property lookup only: a hostile model name like '__proto__'
+        // must be rejected as unknown, not resolve to a prototype member.
+        const modelConfig = Object.prototype.hasOwnProperty.call(MODELS, modelName)
+            ? MODELS[modelName]
+            : undefined;
         if (!modelConfig) {
             throw new Error(`Unknown model: ${modelName}. Available: ${Object.keys(MODELS).join(', ')}`);
         }
 
-        console.log(`Loading model: ${modelConfig.name} (${modelConfig.size})`);
+        // In-memory memo: a second load of the same model in this process reuses
+        // the already-downloaded bytes instead of re-fetching (issue #523).
+        if (this.cache && _inMemoryModelCache.has(modelName)) {
+            return _inMemoryModelCache.get(modelName);
+        }
+
+        // On-disk cache (Node only): models persist across processes so they are
+        // downloaded once, not every run. The browser has the Cache API instead
+        // (handled in fetchWithCache). See issue #523.
+        if (this.cache) {
+            const disk = await this._loadFromDisk(modelName);
+            if (disk) {
+                const cached = { ...disk, config: modelConfig };
+                _inMemoryModelCache.set(modelName, cached);
+                return cached;
+            }
+        }
+
+        console.error(`Loading model: ${modelConfig.name} (${modelConfig.size})`);
 
         const [modelBytes, tokenizerJson] = await Promise.all([
             this.fetchWithCache(modelConfig.model, `${modelName}-model.onnx`, 'arraybuffer'),
             this.fetchWithCache(modelConfig.tokenizer, `${modelName}-tokenizer.json`, 'text'),
         ]);
 
-        return {
+        const result = {
             modelBytes: new Uint8Array(modelBytes),
             tokenizerJson,
             config: modelConfig,
         };
+
+        if (this.cache) {
+            _inMemoryModelCache.set(modelName, result);
+            await this._saveToDisk(modelName, result.modelBytes, tokenizerJson);
+        }
+
+        return result;
+    }
+
+    /**
+     * Resolve the Node on-disk cache dir for a model (null in non-Node envs).
+     * Uses dynamic import so this module stays loadable in browsers/bundlers.
+     */
+    async _diskCacheDir(modelName) {
+        if (typeof process === 'undefined' || !process.versions?.node) return null;
+        const home = process.env.RUVECTOR_CACHE_DIR
+            || process.env.HOME || process.env.USERPROFILE || '/tmp';
+        const path = await import('node:path');
+        return path.join(home, '.ruvector', 'models', modelName);
+    }
+
+    /** Load model bytes + tokenizer from the Node disk cache, or null if absent. */
+    async _loadFromDisk(modelName) {
+        const dir = await this._diskCacheDir(modelName);
+        if (!dir) return null;
+        try {
+            const fs = await import('node:fs');
+            const path = await import('node:path');
+            const modelPath = path.join(dir, 'model.onnx');
+            const tokPath = path.join(dir, 'tokenizer.json');
+            if (!fs.existsSync(modelPath) || !fs.existsSync(tokPath)) return null;
+            const modelBytes = new Uint8Array(fs.readFileSync(modelPath));
+            const tokenizerJson = fs.readFileSync(tokPath, 'utf8');
+            if (modelBytes.length === 0 || tokenizerJson.length === 0) return null;
+            console.error(`  Disk cache hit: ${modelName}`);
+            return { modelBytes, tokenizerJson };
+        } catch {
+            return null;
+        }
+    }
+
+    /** Persist model bytes + tokenizer to the Node disk cache (best-effort). */
+    async _saveToDisk(modelName, modelBytes, tokenizerJson) {
+        const dir = await this._diskCacheDir(modelName);
+        if (!dir) return;
+        try {
+            const fs = await import('node:fs');
+            const path = await import('node:path');
+            fs.mkdirSync(dir, { recursive: true });
+            // Write to temp files then rename, so a crash mid-write can't leave a
+            // truncated cache entry that later reads would trust.
+            const mTmp = path.join(dir, 'model.onnx.tmp');
+            const tTmp = path.join(dir, 'tokenizer.json.tmp');
+            fs.writeFileSync(mTmp, Buffer.from(modelBytes));
+            fs.writeFileSync(tTmp, tokenizerJson);
+            fs.renameSync(mTmp, path.join(dir, 'model.onnx'));
+            fs.renameSync(tTmp, path.join(dir, 'tokenizer.json'));
+        } catch {
+            // Cache write is best-effort; embedding still works without it.
+        }
     }
 
     /**
@@ -161,7 +274,7 @@ export class ModelLoader {
                 const cache = await caches.open(this.cacheStorage);
                 const cached = await cache.match(cacheKey);
                 if (cached) {
-                    console.log(`  Cache hit: ${cacheKey}`);
+                    console.error(`  Cache hit: ${cacheKey}`);
                     return responseType === 'arraybuffer'
                         ? await cached.arrayBuffer()
                         : await cached.text();
@@ -172,7 +285,7 @@ export class ModelLoader {
         }
 
         // Fetch from network
-        console.log(`  Downloading: ${url}`);
+        console.error(`  Downloading: ${url}`);
         const response = await this.fetchWithProgress(url);
 
         if (!response.ok) {
@@ -252,7 +365,7 @@ export class ModelLoader {
     async clearCache() {
         if (typeof caches !== 'undefined') {
             await caches.delete(this.cacheStorage);
-            console.log('Model cache cleared');
+            console.error('Model cache cleared');
         }
     }
 
@@ -279,10 +392,34 @@ export class ModelLoader {
  * ```
  */
 export async function createEmbedder(modelName = DEFAULT_MODEL, wasmModule = null) {
-    // Import WASM module if not provided
+    // Import + initialize the WASM module if not provided.
     if (!wasmModule) {
-        wasmModule = await import('./pkg/ruvector_onnx_embeddings_wasm.js');
-        await wasmModule.default();
+        // The published artifact is a wasm-pack --target bundler build. Its wrapper
+        // (pkg/ruvector_onnx_embeddings_wasm.js) BOTH starts with
+        // `import * as wasm from "...bg.wasm"` — which plain Node ESM cannot resolve —
+        // AND exports no `default` init, so the old `import(wrapper); await default()`
+        // path throws under Node. Mirror the worker's proven init (embed-worker.mjs):
+        // import the _bg.js glue directly and instantiate the .wasm ourselves. This
+        // produces vectors identical to the worker path by construction. (issue #523)
+        if (typeof process !== 'undefined' && process.versions?.node) {
+            const { pathToFileURL, fileURLToPath } = await import('node:url');
+            const path = await import('node:path');
+            const fs = await import('node:fs');
+            const pkgDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'pkg');
+            const bgJs = path.join(pkgDir, 'ruvector_onnx_embeddings_wasm_bg.js');
+            const bgWasm = path.join(pkgDir, 'ruvector_onnx_embeddings_wasm_bg.wasm');
+            wasmModule = await import(pathToFileURL(bgJs).href);
+            const { instance } = await WebAssembly.instantiate(fs.readFileSync(bgWasm), {
+                './ruvector_onnx_embeddings_wasm_bg.js': wasmModule,
+            });
+            if (typeof wasmModule.__wbg_set_wasm === 'function') wasmModule.__wbg_set_wasm(instance.exports);
+            if (typeof instance.exports.__wbindgen_start === 'function') instance.exports.__wbindgen_start();
+        } else {
+            // Browser / bundler: the wrapper resolves the .wasm import and its
+            // default() performs initialization.
+            wasmModule = await import('./pkg/ruvector_onnx_embeddings_wasm.js');
+            await wasmModule.default();
+        }
     }
 
     const loader = new ModelLoader();

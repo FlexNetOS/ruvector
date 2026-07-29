@@ -56,6 +56,18 @@ impl SegmentWriter {
         payload.extend_from_slice(&vector_count.to_le_bytes());
         for (vec_data, &vec_id) in vectors.iter().zip(ids.iter()) {
             payload.extend_from_slice(&vec_id.to_le_bytes());
+            // On little-endian targets the in-memory f32 representation is
+            // already the wire format, so append the whole vector in one copy.
+            #[cfg(target_endian = "little")]
+            {
+                // SAFETY: f32 has no padding and any 4-byte pattern is a valid
+                // byte view; the slice covers exactly vec_data's allocation.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(vec_data.as_ptr() as *const u8, vec_data.len() * 4)
+                };
+                payload.extend_from_slice(bytes);
+            }
+            #[cfg(target_endian = "big")]
             for &val in *vec_data {
                 payload.extend_from_slice(&val.to_le_bytes());
             }
@@ -97,6 +109,18 @@ impl SegmentWriter {
         Ok((seg_id, offset))
     }
 
+    /// Write an INDEX_SEG containing an encoded HNSW index payload
+    /// (codec payload + ID-mapping trailer; see `index_path`).
+    pub(crate) fn write_index_seg<W: Write + Seek>(
+        &mut self,
+        writer: &mut W,
+        payload: &[u8],
+    ) -> io::Result<(u64, u64)> {
+        let seg_id = self.alloc_seg_id();
+        let offset = self.write_segment(writer, SegmentType::Index as u8, seg_id, payload)?;
+        Ok((seg_id, offset))
+    }
+
     /// Write a META_SEG for vector metadata.
     #[allow(dead_code)]
     pub(crate) fn write_meta_seg<W: Write + Seek>(
@@ -110,10 +134,32 @@ impl SegmentWriter {
         Ok((seg_id, offset))
     }
 
+    /// Write persisted copy-on-write cluster-map state.
+    pub(crate) fn write_cow_map_seg<W: Write + Seek>(
+        &mut self,
+        writer: &mut W,
+        payload: &[u8],
+    ) -> io::Result<(u64, u64)> {
+        let seg_id = self.alloc_seg_id();
+        let offset = self.write_segment(writer, SegmentType::CowMap as u8, seg_id, payload)?;
+        Ok((seg_id, offset))
+    }
+
+    /// Write persisted branch membership state.
+    pub(crate) fn write_membership_seg<W: Write + Seek>(
+        &mut self,
+        writer: &mut W,
+        payload: &[u8],
+    ) -> io::Result<(u64, u64)> {
+        let seg_id = self.alloc_seg_id();
+        let offset = self.write_segment(writer, SegmentType::Membership as u8, seg_id, payload)?;
+        Ok((seg_id, offset))
+    }
+
     /// Write a minimal MANIFEST_SEG recording current state.
     ///
     /// This is a simplified manifest that stores:
-    /// - epoch, dimension, total_vectors, total_segments, profile_id
+    /// - epoch, dimension, total_vectors, total_segments, profile_id, metric_id
     /// - segment directory entries (seg_id, offset, length, type)
     /// - deletion bitmap (vector IDs as simple packed u64 array)
     /// - file identity (68 bytes, appended for lineage provenance)
@@ -125,6 +171,7 @@ impl SegmentWriter {
         dimension: u16,
         total_vectors: u64,
         profile_id: u8,
+        metric_id: u8,
         segment_dir: &[(u64, u64, u64, u8)], // (seg_id, offset, payload_len, seg_type)
         deleted_ids: &[u64],
     ) -> io::Result<(u64, u64)> {
@@ -134,6 +181,7 @@ impl SegmentWriter {
             dimension,
             total_vectors,
             profile_id,
+            metric_id,
             segment_dir,
             deleted_ids,
             None,
@@ -141,6 +189,10 @@ impl SegmentWriter {
     }
 
     /// Write a MANIFEST_SEG with optional FileIdentity appended.
+    ///
+    /// The `metric_id` is encoded into header byte [19] (previously a reserved
+    /// zero byte): 0 = L2, 1 = InnerProduct, 2 = Cosine.  Old stores that
+    /// wrote 0x00 at that position boot correctly as L2 (backward-compatible).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_manifest_seg_with_identity<W: Write + Seek>(
         &mut self,
@@ -149,6 +201,7 @@ impl SegmentWriter {
         dimension: u16,
         total_vectors: u64,
         profile_id: u8,
+        metric_id: u8,
         segment_dir: &[(u64, u64, u64, u8)],
         deleted_ids: &[u64],
         file_identity: Option<&rvf_types::FileIdentity>,
@@ -166,12 +219,15 @@ impl SegmentWriter {
         let mut payload = Vec::with_capacity(payload_size);
 
         // Manifest header.
+        // Layout: epoch[0..4] | dim[4..6] | total_vecs[6..14] | seg_count[14..18]
+        //         | profile_id[18] | metric_id[19] | reserved[20..22]
         payload.extend_from_slice(&epoch.to_le_bytes());
         payload.extend_from_slice(&dimension.to_le_bytes());
         payload.extend_from_slice(&total_vectors.to_le_bytes());
         payload.extend_from_slice(&seg_count.to_le_bytes());
         payload.push(profile_id);
-        payload.extend_from_slice(&[0u8; 3]); // reserved
+        payload.push(metric_id); // byte [19]: distance metric identifier
+        payload.extend_from_slice(&[0u8; 2]); // bytes [20..22]: reserved
 
         // Segment directory.
         for &(sid, off, plen, stype) in segment_dir {
@@ -414,9 +470,8 @@ impl SegmentWriter {
         let mut header = SegmentHeader::new(seg_type, seg_id);
         header.payload_length = payload.len() as u64;
 
-        // Compute a simple content hash (first 16 bytes of CRC-based hash).
-        let hash = content_hash(payload);
-        header.content_hash = hash;
+        // Content hash: single shared implementation (see crate::hashing).
+        header.content_hash = crate::hashing::legacy_content_hash(payload);
 
         // Write header as raw bytes.
         let header_bytes = header_to_bytes(&header);
@@ -453,34 +508,6 @@ fn header_to_bytes(h: &SegmentHeader) -> [u8; SEGMENT_HEADER_SIZE] {
     buf[0x38..0x3C].copy_from_slice(&h.uncompressed_len.to_le_bytes());
     buf[0x3C..0x40].copy_from_slice(&h.alignment_pad.to_le_bytes());
     buf
-}
-
-/// Compute a simple 16-byte content hash (CRC32-based, rotated for distinct bytes).
-fn content_hash(data: &[u8]) -> [u8; 16] {
-    let mut hash = [0u8; 16];
-    let crc = crc32_slice(data);
-    // Use different rotations of CRC to fill 16 bytes with distinct values.
-    for i in 0..4 {
-        let rotated = crc.rotate_left(i as u32 * 8);
-        hash[i * 4..(i + 1) * 4].copy_from_slice(&rotated.to_le_bytes());
-    }
-    hash
-}
-
-/// Simple CRC32 computation.
-fn crc32_slice(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFFFFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]

@@ -24,7 +24,11 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 const path = require('path');
 const fs = require('fs');
-const { execSync, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
+
+// ADR-256: default-deny MCP tool-access policy (RUVECTOR_MCP_ALLOW/DENY/PROFILE)
+const { buildToolPolicy, isToolAllowed, filterAllowedTools } = require('./mcp-policy.js');
+const MCP_TOOL_POLICY = buildToolPolicy(process.env);
 
 // ── Security Helpers ────────────────────────────────────────────────────────
 
@@ -95,6 +99,76 @@ function sanitizeNumericArg(arg, defaultVal) {
   return Number.isFinite(n) && n > 0 ? n : (defaultVal || 0);
 }
 
+const RUVECTOR_CLI = path.join(__dirname, 'cli.js');
+const NPX_COMMAND = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+
+/**
+ * Execute this package's CLI without a shell.
+ *
+ * MCP arguments are untrusted. Keeping the executable and every argument
+ * separate prevents quotes, substitutions, and shell metacharacters from
+ * becoming executable syntax.
+ */
+function runRuvectorCli(args, options = {}) {
+  return execFileSync(process.execPath, [RUVECTOR_CLI, ...args.map(String)], {
+    encoding: 'utf-8',
+    ...options,
+  });
+}
+
+/**
+ * Execute an external npx package without a shell.
+ */
+function runNpxPackage(packageSpec, args, options = {}) {
+  return execFileSync(NPX_COMMAND, [packageSpec, ...args.map(String)], {
+    encoding: 'utf-8',
+    ...options,
+  });
+}
+
+// MCP tool result returned when @ruvector/pi-brain is absent or unusable, so
+// every brain_* handler surfaces the same actionable install hint (issue #661).
+const BRAIN_MISSING_DEP_RESULT = {
+  content: [{
+    type: 'text',
+    text: JSON.stringify({
+      success: false,
+      error: 'Brain tools require @ruvector/pi-brain',
+      hint: 'npm install @ruvector/pi-brain',
+    }, null, 2),
+  }],
+};
+
+// Load a pi-brain client for the brain_* MCP tools.
+//
+// Returns `{ client }` on success or `{ missing: true }` when @ruvector/pi-brain
+// is either not installed OR resolves to something that does not expose a usable
+// PiBrainClient constructor. The handlers additionally guard the specific method
+// they call: a package that constructs but lacks e.g. `.sync` surfaced as an
+// opaque `TypeError: client.sync is not a function` before this (issue #661) —
+// mirroring the CLI's `requirePiBrain()` behavior on the MCP surface. Any other
+// error (network, auth, a real bug in a present package) is re-thrown for the
+// caller's catch to report as an actual error rather than a missing-dep hint.
+function loadBrainClient() {
+  let piBrain;
+  try {
+    piBrain = require('@ruvector/pi-brain');
+  } catch (e) {
+    if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
+      return { missing: true };
+    }
+    throw e;
+  }
+  const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
+  if (typeof PiBrainClient !== 'function') {
+    return { missing: true };
+  }
+  const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
+  const key = process.env.PI || '';
+  const client = new PiBrainClient({ url, key });
+  return { client };
+}
+
 // Try to load the full IntelligenceEngine
 let IntelligenceEngine = null;
 let engineAvailable = false;
@@ -105,6 +179,18 @@ try {
   engineAvailable = true;
 } catch (e) {
   // IntelligenceEngine not available
+}
+
+// ADR-210 D0: shared embedding-provenance invariant — the SAME dist module
+// bin/cli.js uses (loadProvenance there), so the MCP server's writes to
+// .ruvector/intelligence.json enforce the same contract instead of bypassing
+// it. When dist is missing, enforcement degrades exactly like the CLI:
+// pre-ADR-210 behavior.
+let provenanceMod = null;
+try {
+  provenanceMod = require('../dist/core/embedding-provenance.js');
+} catch (e) {
+  provenanceMod = null;
 }
 
 // Intelligence class with full RuVector stack support
@@ -169,10 +255,124 @@ class Intelligence {
   load() {
     try {
       if (fs.existsSync(this.intelPath)) {
-        return JSON.parse(fs.readFileSync(this.intelPath, 'utf-8'));
+        const data = JSON.parse(fs.readFileSync(this.intelPath, 'utf-8'));
+        // Untrusted on-disk input (ADR-210 security pass): a corrupted or
+        // hand-edited store must not crash array/object consumers.
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+          if (!Array.isArray(data.memories)) data.memories = [];
+          return data;
+        }
       }
     } catch {}
     return { patterns: {}, memories: [], trajectories: [], errors: {}, agents: {}, edges: [] };
+  }
+
+  // ==========================================================================
+  // ADR-210 D0: embedding-provenance invariant for intelligence.json writes.
+  // Same contract bin/cli.js enforces (this server previously bypassed it):
+  // mismatched vector writes are refused naming both sides, legacy stores
+  // (vectors without provenance) are read-only until `ruvector hooks reembed`,
+  // and degraded reads warn once per process.
+  // ==========================================================================
+
+  storedProvenance() {
+    const raw = this.data.embeddingProvenance || null;
+    if (!provenanceMod) return raw;
+    return provenanceMod.sanitizeProvenance(raw);
+  }
+
+  vectorMemoryCount() {
+    const mems = Array.isArray(this.data.memories) ? this.data.memories : [];
+    return mems.filter(m => m && Array.isArray(m.embedding) && m.embedding.length > 0).length;
+  }
+
+  /** Store predates ADR-210 (has vectors but no provenance record). */
+  isLegacyVectorStore() {
+    return !this.storedProvenance() && this.vectorMemoryCount() > 0;
+  }
+
+  /** Legacy default: hash, dimension inferred from the stored vectors. */
+  inferredLegacyProvenance() {
+    const mems = Array.isArray(this.data.memories) ? this.data.memories : [];
+    const first = mems.find(m => m && Array.isArray(m.embedding) && m.embedding.length > 0);
+    const dim = first ? first.embedding.length : 256;
+    if (provenanceMod) return provenanceMod.legacyHashProvenance(dim);
+    return { embedderKind: 'hash', modelId: null, dimension: dim, normalize: false, prefixPolicy: 'none' };
+  }
+
+  /** Provenance of the embedder that just produced `embedding`. */
+  activeWriteProvenance(embedding) {
+    if (this.engine && typeof this.engine.getActiveProvenance === 'function') {
+      try { return this.engine.getActiveProvenance(); } catch {}
+    }
+    return { embedderKind: 'hash', modelId: null, dimension: embedding.length, normalize: true, prefixPolicy: 'none' };
+  }
+
+  /**
+   * Gate a vector write (throws on refusal). Stamps provenance on the first
+   * write to a fresh store; refuses mismatched writes naming both sides;
+   * legacy stores are read-only until re-embedded.
+   */
+  checkVectorWrite(active) {
+    if (!provenanceMod || !active) return; // enforcement needs the dist module
+    if (this.isLegacyVectorStore()) {
+      const legacy = this.inferredLegacyProvenance();
+      const err = new Error(
+        `Vector store ${this.intelPath} predates embedding provenance (ADR-210) and is read-only for vector writes. ` +
+        `Stored vectors are treated as ${provenanceMod.describeProvenance(legacy)}; the active embedder is ` +
+        `${provenanceMod.describeProvenance(active)}. Run 'ruvector hooks reembed' to re-embed and unlock it.`
+      );
+      err.code = 'ERR_LEGACY_STORE_READONLY';
+      throw err;
+    }
+    const stored = this.storedProvenance();
+    if (!stored) {
+      this.data.embeddingProvenance = active;
+      return;
+    }
+    provenanceMod.assertProvenanceMatch(stored, active, this.intelPath);
+  }
+
+  /**
+   * Non-throwing write gate honoring RUVECTOR_REEMBED (D5): refuse (default)
+   * rethrows; warn skips the write with one stderr warning per process.
+   */
+  guardVectorWrite(active) {
+    try {
+      this.checkVectorWrite(active);
+      return { ok: true };
+    } catch (e) {
+      const policy = provenanceMod ? provenanceMod.resolveReembedPolicy() : 'refuse';
+      if (policy === 'warn') {
+        if (!Intelligence._reembedWarned) {
+          Intelligence._reembedWarned = true;
+          console.error(`ruvector: ${e.message} (RUVECTOR_REEMBED=warn: store stays read-only, write skipped)`);
+        }
+        return { ok: false, skipped: true, error: e.message };
+      }
+      if (policy === 'auto') e.message += ` (RUVECTOR_REEMBED=auto: run 'ruvector hooks reembed' — in-place re-embedding needs the CLI)`;
+      throw e;
+    }
+  }
+
+  /**
+   * ADR-210: reads stay allowed on legacy/mismatched stores, but similarity
+   * against differently-embedded vectors is meaningless — say so once.
+   */
+  warnRecallProvenance(active) {
+    if (!provenanceMod || !active || Intelligence._recallWarned) return;
+    let stored = this.storedProvenance();
+    if (!stored && this.isLegacyVectorStore()) stored = this.inferredLegacyProvenance();
+    if (!stored) return;
+    const mismatches = provenanceMod.compareProvenance(stored, active);
+    if (mismatches.length > 0) {
+      Intelligence._recallWarned = true;
+      console.error(
+        `ruvector: recall quality degraded — stored vectors are ${provenanceMod.describeProvenance(stored)} ` +
+        `but the query was embedded as ${provenanceMod.describeProvenance(active)} (differs on: ${mismatches.join(', ')}). ` +
+        `Run 'ruvector hooks reembed' to fix.`
+      );
+    }
   }
 
   save() {
@@ -207,6 +407,8 @@ class Intelligence {
           sonaEnabled: engineStats.sonaEnabled,
           attentionEnabled: engineStats.attentionEnabled,
           embeddingDim: engineStats.memoryDimensions,
+          // ADR-210 D1: which embedder actually serves embeds right now
+          embedderKind: engineStats.embedderKind,
           totalMemories: engineStats.totalMemories,
           totalEpisodes: engineStats.totalEpisodes,
           trajectoriesRecorded: engineStats.trajectoriesRecorded,
@@ -248,19 +450,31 @@ class Intelligence {
   async remember(content, type = 'general') {
     // Use engine if available (VectorDB storage)
     if (this.engine) {
+      let entry = null;
       try {
-        const entry = await this.engine.remember(content, type);
+        entry = await this.engine.remember(content, type);
+      } catch {}
+      if (entry) {
+        // ADR-210 D0: validate provenance BEFORE persisting. Refusals
+        // propagate as errors (the tool handler reports them) — no silent
+        // fallback into a mixed store.
+        const guard = this.guardVectorWrite(this.activeWriteProvenance(entry.embedding));
+        if (!guard.ok) return { stored: false, skipped: true, reason: guard.error };
         // Also store in legacy format
-        this.data.memories = this.data.memories || [];
+        this.data.memories = Array.isArray(this.data.memories) ? this.data.memories : [];
         this.data.memories.push({ content, type, created: new Date().toISOString(), embedding: entry.embedding });
         this.save();
         return { stored: true, total: this.data.memories.length, engineStored: true };
-      } catch {}
+      }
     }
 
     // Fallback
-    this.data.memories = this.data.memories || [];
-    this.data.memories.push({ content, type, created: new Date().toISOString(), embedding: this.embed(content) });
+    const embedding = this.embed(content);
+    // ADR-210 D0: same gate on the fallback hash path.
+    const guard = this.guardVectorWrite({ embedderKind: 'hash', modelId: null, dimension: embedding.length, normalize: true, prefixPolicy: 'none' });
+    if (!guard.ok) return { stored: false, skipped: true, reason: guard.error };
+    this.data.memories = Array.isArray(this.data.memories) ? this.data.memories : [];
+    this.data.memories.push({ content, type, created: new Date().toISOString(), embedding });
     this.save();
     return { stored: true, total: this.data.memories.length };
   }
@@ -270,6 +484,11 @@ class Intelligence {
     if (this.engine) {
       try {
         const results = await this.engine.recall(query, topK);
+        // ADR-210: after recall the engine's lazy init has settled, so the
+        // active provenance reflects the embedder that served the query.
+        if (typeof this.engine.getActiveProvenance === 'function') {
+          this.warnRecallProvenance(this.engine.getActiveProvenance());
+        }
         return results.map(r => ({
           content: r.content,
           type: r.type,
@@ -282,10 +501,12 @@ class Intelligence {
 
     // Fallback: brute-force
     const queryEmbed = this.embed(query);
-    const scored = (this.data.memories || []).map((m, i) => ({
+    this.warnRecallProvenance({ embedderKind: 'hash', modelId: null, dimension: queryEmbed.length, normalize: true, prefixPolicy: 'none' });
+    const mems = Array.isArray(this.data.memories) ? this.data.memories : [];
+    const scored = mems.map((m, i) => ({
       ...m,
       index: i,
-      score: this.similarity(queryEmbed, m.embedding)
+      score: this.similarity(queryEmbed, m && m.embedding)
     }));
     return scored.sort((a, b) => b.score - a.score).slice(0, topK);
   }
@@ -363,7 +584,7 @@ class Intelligence {
 const server = new Server(
   {
     name: 'ruvector',
-    version: '0.2.0',
+    version: require('../package.json').version,
   },
   {
     capabilities: {
@@ -1124,9 +1345,10 @@ const TOOLS = [
       properties: {
         path: { type: 'string', description: 'File path for the new .rvf store' },
         dimension: { type: 'number', description: 'Vector dimensionality (e.g. 128, 384, 768, 1536)' },
+        dimensions: { type: 'number', description: 'Alias for dimension' },
         metric: { type: 'string', description: 'Distance metric: cosine, l2, or dotproduct', default: 'cosine' }
       },
-      required: ['path', 'dimension']
+      required: ['path']
     }
   },
   {
@@ -1201,7 +1423,7 @@ const TOOLS = [
   },
   {
     name: 'rvf_derive',
-    description: 'Derive a child RVF store from a parent using copy-on-write branching',
+    description: 'Derive a lineage child RVF store (does not inherit parent query results)',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1209,6 +1431,29 @@ const TOOLS = [
         child_path: { type: 'string', description: 'Path for the new child .rvf store' }
       },
       required: ['parent_path', 'child_path']
+    }
+  },
+  {
+    name: 'rvf_branch',
+    description: 'Create a durable copy-on-write branch that inherits parent query results',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        parent_path: { type: 'string', description: 'Path to a frozen parent .rvf store' },
+        child_path: { type: 'string', description: 'Path for the new child .rvf store' }
+      },
+      required: ['parent_path', 'child_path']
+    }
+  },
+  {
+    name: 'rvf_freeze',
+    description: 'Freeze an RVF generation before creating copy-on-write branches',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the .rvf store to freeze' }
+      },
+      required: ['path']
     }
   },
   {
@@ -1545,14 +1790,29 @@ const TOOLS = [
   }
 ];
 
-// List tools handler
+// List tools handler — only expose tools permitted by the access policy (ADR-256)
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS };
+  return { tools: filterAllowedTools(TOOLS, MCP_TOOL_POLICY) };
 });
 
 // Call tool handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  // ADR-256 default-deny gate: refuse tools excluded by RUVECTOR_MCP_ALLOW/DENY/PROFILE
+  if (!isToolAllowed(name, MCP_TOOL_POLICY)) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: false,
+          error: `Tool '${name}' is denied by the MCP access policy (ADR-256). ` +
+            `Adjust RUVECTOR_MCP_ALLOW / RUVECTOR_MCP_DENY / RUVECTOR_MCP_PROFILE to permit it.`,
+        }, null, 2),
+      }],
+      isError: true,
+    };
+  }
 
   try {
     switch (name) {
@@ -1586,12 +1846,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_remember': {
+        // ADR-210 D0: provenance refusals throw and surface via the catch-all
+        // as isError; RUVECTOR_REEMBED=warn skips return { stored: false }.
         const result = await intel.remember(args.content, args.type || 'general');
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: true,
+              success: result.stored !== false,
               ...result
             }, null, 2)
           }]
@@ -1619,13 +1881,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_init': {
-        let cmd = 'npx ruvector hooks init';
-        if (args.force) cmd += ' --force';
-        if (args.pretrain) cmd += ' --pretrain';
-        if (args.build_agents) cmd += ` --build-agents ${sanitizeShellArg(args.build_agents)}`;
+        const commandArgs = ['hooks', 'init'];
+        if (args.force) commandArgs.push('--force');
+        if (args.pretrain) commandArgs.push('--pretrain');
+        if (args.build_agents) commandArgs.push('--build-agents', args.build_agents);
 
         try {
-          const output = execSync(cmd, { encoding: 'utf-8', timeout: 60000 });
+          const output = runRuvectorCli(commandArgs, { timeout: 60000 });
           return {
             content: [{
               type: 'text',
@@ -1643,13 +1905,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_pretrain': {
-        let cmd = 'npx ruvector hooks pretrain';
-        if (args.depth) cmd += ` --depth ${sanitizeNumericArg(args.depth, 3)}`;
-        if (args.skip_git) cmd += ' --skip-git';
-        if (args.verbose) cmd += ' --verbose';
+        const commandArgs = ['hooks', 'pretrain'];
+        if (args.depth) commandArgs.push('--depth', sanitizeNumericArg(args.depth, 3));
+        if (args.skip_git) commandArgs.push('--skip-git');
+        if (args.verbose) commandArgs.push('--verbose');
 
         try {
-          const output = execSync(cmd, { encoding: 'utf-8', timeout: 120000 });
+          const output = runRuvectorCli(commandArgs, { timeout: 120000 });
           // Reload intelligence after pretrain
           intel.data = intel.load();
           return {
@@ -1673,12 +1935,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_build_agents': {
-        let cmd = 'npx ruvector hooks build-agents';
-        if (args.focus) cmd += ` --focus ${sanitizeShellArg(args.focus)}`;
-        if (args.include_prompts) cmd += ' --include-prompts';
+        const commandArgs = ['hooks', 'build-agents'];
+        if (args.focus) commandArgs.push('--focus', args.focus);
+        if (args.include_prompts) commandArgs.push('--include-prompts');
 
         try {
-          const output = execSync(cmd, { encoding: 'utf-8', timeout: 30000 });
+          const output = runRuvectorCli(commandArgs, { timeout: 30000 });
           return {
             content: [{
               type: 'text',
@@ -1697,7 +1959,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_verify': {
         try {
-          const output = execSync('npx ruvector hooks verify', { encoding: 'utf-8', timeout: 15000 });
+          const output = runRuvectorCli(['hooks', 'verify'], { timeout: 15000 });
           return {
             content: [{
               type: 'text',
@@ -1715,11 +1977,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_doctor': {
-        let cmd = 'npx ruvector hooks doctor';
-        if (args.fix) cmd += ' --fix';
+        const commandArgs = ['hooks', 'doctor'];
+        if (args.fix) commandArgs.push('--fix');
 
         try {
-          const output = execSync(cmd, { encoding: 'utf-8', timeout: 15000 });
+          const output = runRuvectorCli(commandArgs, { timeout: 15000 });
           return {
             content: [{
               type: 'text',
@@ -1818,6 +2080,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
           }
           if (data.memories && Array.isArray(data.memories)) {
+            // ADR-210 D0: imported memories carrying vectors are a vector
+            // write — enforce the store's embedding provenance (this was a
+            // bypass before wave 2).
+            const withVectors = data.memories.filter(m => m && Array.isArray(m.embedding) && m.embedding.length > 0);
+            if (withVectors.length > 0 && provenanceMod) {
+              if (intel.isLegacyVectorStore()) {
+                const err = new Error(
+                  `Vector store ${intel.intelPath} predates embedding provenance (ADR-210) and is read-only for vector writes. ` +
+                  `Run 'ruvector hooks reembed' before importing vector memories.`
+                );
+                err.code = 'ERR_LEGACY_STORE_READONLY';
+                throw err;
+              }
+              const stored = intel.storedProvenance();
+              if (stored) {
+                const bad = withVectors.find(m => m.embedding.length !== stored.dimension);
+                if (bad) {
+                  throw new Error(
+                    `Import refused (ADR-210): ${intel.intelPath} records embedding provenance ` +
+                    `${provenanceMod.describeProvenance(stored)}, but imported memories contain ` +
+                    `${bad.embedding.length}-dimensional vectors with undeclared provenance. ` +
+                    `Mixed stores are never created — re-embed the data or the store.`
+                  );
+                }
+              }
+            }
             if (merge) {
               intel.data.memories = [...(intel.data.memories || []), ...data.memories];
             } else {
@@ -1848,7 +2136,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [{
               type: 'text',
               text: JSON.stringify({ success: false, error: e.message }, null, 2)
-            }]
+            }],
+            isError: true
           };
         }
       }
@@ -2174,8 +2463,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_ast_analyze': {
         try {
-          const safeFile = sanitizeShellArg(args.file);
-          const output = execSync(`npx ruvector hooks ast-analyze "${safeFile}" --json`, { encoding: 'utf-8', timeout: 30000 });
+          const output = runRuvectorCli(['hooks', 'ast-analyze', args.file, '--json'], { timeout: 30000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2184,9 +2472,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_ast_complexity': {
         try {
-          const filesArg = args.files.map(f => `"${sanitizeShellArg(f)}"`).join(' ');
           const threshold = parseInt(args.threshold, 10) || 10;
-          const output = execSync(`npx ruvector hooks ast-complexity ${filesArg} --threshold ${threshold}`, { encoding: 'utf-8', timeout: 60000 });
+          const output = runRuvectorCli(
+            ['hooks', 'ast-complexity', ...args.files, '--threshold', threshold],
+            { timeout: 60000 },
+          );
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2195,8 +2485,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_diff_analyze': {
         try {
-          const cmd = args.commit ? `npx ruvector hooks diff-analyze "${sanitizeShellArg(args.commit)}" --json` : 'npx ruvector hooks diff-analyze --json';
-          const output = execSync(cmd, { encoding: 'utf-8', timeout: 60000 });
+          const commandArgs = ['hooks', 'diff-analyze'];
+          if (args.commit) commandArgs.push(args.commit);
+          commandArgs.push('--json');
+          const output = runRuvectorCli(commandArgs, { timeout: 60000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2205,8 +2497,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_diff_classify': {
         try {
-          const cmd = args.commit ? `npx ruvector hooks diff-classify "${sanitizeShellArg(args.commit)}"` : 'npx ruvector hooks diff-classify';
-          const output = execSync(cmd, { encoding: 'utf-8', timeout: 30000 });
+          const commandArgs = ['hooks', 'diff-classify'];
+          if (args.commit) commandArgs.push(args.commit);
+          const output = runRuvectorCli(commandArgs, { timeout: 30000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2217,7 +2510,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const topK = parseInt(args.top_k, 10) || 5;
           const commits = parseInt(args.commits, 10) || 50;
-          const output = execSync(`npx ruvector hooks diff-similar -k ${topK} --commits ${commits}`, { encoding: 'utf-8', timeout: 120000 });
+          const output = runRuvectorCli(
+            ['hooks', 'diff-similar', '-k', topK, '--commits', commits],
+            { timeout: 120000 },
+          );
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2226,8 +2522,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_coverage_route': {
         try {
-          const safeFile = sanitizeShellArg(args.file);
-          const output = execSync(`npx ruvector hooks coverage-route "${safeFile}"`, { encoding: 'utf-8', timeout: 15000 });
+          const output = runRuvectorCli(['hooks', 'coverage-route', args.file], { timeout: 15000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2236,8 +2531,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_coverage_suggest': {
         try {
-          const filesArg = args.files.map(f => `"${sanitizeShellArg(f)}"`).join(' ');
-          const output = execSync(`npx ruvector hooks coverage-suggest ${filesArg}`, { encoding: 'utf-8', timeout: 30000 });
+          const output = runRuvectorCli(['hooks', 'coverage-suggest', ...args.files], { timeout: 30000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2246,8 +2540,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_graph_mincut': {
         try {
-          const filesArg = args.files.map(f => `"${sanitizeShellArg(f)}"`).join(' ');
-          const output = execSync(`npx ruvector hooks graph-mincut ${filesArg}`, { encoding: 'utf-8', timeout: 60000 });
+          const output = runRuvectorCli(['hooks', 'graph-mincut', ...args.files], { timeout: 60000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2256,10 +2549,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_graph_cluster': {
         try {
-          const filesArg = args.files.map(f => `"${sanitizeShellArg(f)}"`).join(' ');
-          const method = sanitizeShellArg(args.method || 'louvain');
+          const method = args.method || 'louvain';
           const clusters = parseInt(args.clusters, 10) || 3;
-          const output = execSync(`npx ruvector hooks graph-cluster ${filesArg} --method ${method} --clusters ${clusters}`, { encoding: 'utf-8', timeout: 60000 });
+          const output = runRuvectorCli(
+            ['hooks', 'graph-cluster', ...args.files, '--method', method, '--clusters', clusters],
+            { timeout: 60000 },
+          );
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2268,8 +2563,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_security_scan': {
         try {
-          const filesArg = args.files.map(f => `"${sanitizeShellArg(f)}"`).join(' ');
-          const output = execSync(`npx ruvector hooks security-scan ${filesArg}`, { encoding: 'utf-8', timeout: 120000 });
+          const output = runRuvectorCli(['hooks', 'security-scan', ...args.files], { timeout: 120000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2278,11 +2572,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_rag_context': {
         try {
-          const safeQuery = sanitizeShellArg(args.query);
           const topK = parseInt(args.top_k, 10) || 5;
-          let cmd = `npx ruvector hooks rag-context "${safeQuery}" -k ${topK}`;
-          if (args.rerank) cmd += ' --rerank';
-          const output = execSync(cmd, { encoding: 'utf-8', timeout: 30000 });
+          const commandArgs = ['hooks', 'rag-context', args.query, '-k', topK];
+          if (args.rerank) commandArgs.push('--rerank');
+          const output = runRuvectorCli(commandArgs, { timeout: 30000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2293,7 +2586,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const days = parseInt(args.days, 10) || 30;
           const top = parseInt(args.top, 10) || 10;
-          const output = execSync(`npx ruvector hooks git-churn --days ${days} --top ${top}`, { encoding: 'utf-8', timeout: 30000 });
+          const output = runRuvectorCli(
+            ['hooks', 'git-churn', '--days', days, '--top', top],
+            { timeout: 30000 },
+          );
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2789,10 +3085,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // BACKGROUND WORKERS HANDLERS (via agentic-flow)
       // ============================================
       case 'workers_dispatch': {
-        const prompt = sanitizeShellArg(args.prompt);
+        const prompt = String(args.prompt);
         try {
-          const result = execSync(`npx agentic-flow@alpha workers dispatch "${prompt.replace(/"/g, '\\"')}"`, {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'dispatch', prompt], {
             timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2812,9 +3107,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_status': {
         try {
-          const cmdArgs = args.workerId ? `workers status ${sanitizeShellArg(args.workerId)}` : 'workers status';
-          const result = execSync(`npx agentic-flow@alpha ${cmdArgs}`, {
-            encoding: 'utf-8',
+          const commandArgs = ['workers', 'status'];
+          if (args.workerId) commandArgs.push(String(args.workerId));
+          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2833,9 +3128,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_results': {
         try {
-          const cmdArgs = args.json ? 'workers results --json' : 'workers results';
-          const result = execSync(`npx agentic-flow@alpha ${cmdArgs}`, {
-            encoding: 'utf-8',
+          const commandArgs = ['workers', 'results'];
+          if (args.json) commandArgs.push('--json');
+          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2864,8 +3159,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_triggers': {
         try {
-          const result = execSync('npx agentic-flow@alpha workers triggers', {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'triggers'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2884,8 +3178,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_stats': {
         try {
-          const result = execSync('npx agentic-flow@alpha workers stats', {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'stats'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2905,8 +3198,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Custom Worker System handlers (agentic-flow@alpha.39+)
       case 'workers_presets': {
         try {
-          const result = execSync('npx agentic-flow@alpha workers presets', {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'presets'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2925,8 +3217,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_phases': {
         try {
-          const result = execSync('npx agentic-flow@alpha workers phases', {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'phases'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2944,14 +3235,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'workers_create': {
-        const name = args.name;
-        const preset = args.preset || 'quick-scan';
-        const triggers = args.triggers;
+        const name = String(args.name || '');
+        const preset = String(args.preset || 'quick-scan');
+        const triggers = args.triggers == null ? null : String(args.triggers);
         try {
-          let cmd = `npx agentic-flow@alpha workers create "${name}" --preset ${preset}`;
-          if (triggers) cmd += ` --triggers "${triggers}"`;
-          const result = execSync(cmd, {
-            encoding: 'utf-8',
+          // Never interpolate MCP-controlled fields into a shell command.
+          // execFileSync passes each value as one argument, so names/triggers
+          // containing quotes or shell metacharacters cannot escape to a shell.
+          const commandArgs = ['workers', 'create', name, '--preset', preset];
+          if (triggers) commandArgs.push('--triggers', triggers);
+          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
             timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2970,11 +3263,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'workers_run': {
-        const name = sanitizeShellArg(args.name);
-        const targetPath = sanitizeShellArg(args.path || '.');
+        const name = String(args.name);
+        const targetPath = String(args.path || '.');
         try {
-          const result = execSync(`npx agentic-flow@alpha workers run "${name}" --path "${targetPath}"`, {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'run', name, '--path', targetPath], {
             timeout: 120000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -2995,8 +3287,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_custom': {
         try {
-          const result = execSync('npx agentic-flow@alpha workers custom', {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'custom'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3015,10 +3306,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_init_config': {
         try {
-          let cmd = 'npx agentic-flow@alpha workers init-config';
-          if (args.force) cmd += ' --force';
-          const result = execSync(cmd, {
-            encoding: 'utf-8',
+          const commandArgs = ['workers', 'init-config'];
+          if (args.force) commandArgs.push('--force');
+          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3037,10 +3327,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'workers_load_config': {
-        const configFile = sanitizeShellArg(args.file || 'workers.yaml');
+        const configFile = String(args.file || 'workers.yaml');
         try {
-          const result = execSync(`npx agentic-flow@alpha workers load-config --file "${configFile}"`, {
-            encoding: 'utf-8',
+          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'load-config', '--file', configFile], {
             timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3062,12 +3351,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'rvf_create': {
         try {
           const safePath = validateRvfPath(args.path);
+          // The @ruvector/rvf SDK option is `dimensions` (plural); accept the
+          // singular `dimension` this tool has always advertised too (#641).
+          const dimensions = args.dimensions ?? args.dimension;
+          if (!Number.isInteger(dimensions) || dimensions <= 0) {
+            throw new Error(`Missing or invalid dimension: expected a positive integer, got ${JSON.stringify(dimensions)}`);
+          }
           const { createRvfStore } = require('../dist/core/rvf-wrapper.js');
-          const store = await createRvfStore(safePath, { dimension: args.dimension, metric: args.metric || 'cosine' });
-          const status = store.status ? await store.status() : { dimension: args.dimension };
+          const store = await createRvfStore(safePath, { dimensions, metric: args.metric || 'cosine' });
+          const status = store.status ? await store.status() : { dimensions };
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, path: safePath, ...status }, null, 2) }] };
         } catch (e) {
-          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message, hint: 'Install @ruvector/rvf: npm install @ruvector/rvf' }, null, 2) }], isError: true };
+          // Only suggest installing the package when it is actually missing (#641).
+          const payload = { success: false, error: e.message };
+          if (/not installed|cannot find module/i.test(e.message)) {
+            payload.hint = 'Install @ruvector/rvf: npm install @ruvector/rvf';
+          }
+          return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true };
         }
       }
 
@@ -3149,16 +3449,65 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'rvf_derive': {
+        let store;
+        let child;
         try {
           const safeParent = validateRvfPath(args.parent_path);
           const safeChild = validateRvfPath(args.child_path);
           const { openRvfStore, rvfDerive, rvfClose } = require('../dist/core/rvf-wrapper.js');
-          const store = await openRvfStore(safeParent);
-          await rvfDerive(store, safeChild);
-          await rvfClose(store);
+          store = await openRvfStore(safeParent);
+          child = await rvfDerive(store, safeChild);
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, parent: safeParent, child: safeChild }, null, 2) }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
+        } finally {
+          const { rvfClose } = require('../dist/core/rvf-wrapper.js');
+          await Promise.allSettled([child && rvfClose(child), store && rvfClose(store)]);
+        }
+      }
+
+      case 'rvf_branch': {
+        let parent;
+        let child;
+        try {
+          const safeParent = validateRvfPath(args.parent_path);
+          const safeChild = validateRvfPath(args.child_path);
+          const { openRvfStore, rvfBranch } = require('../dist/core/rvf-wrapper.js');
+          parent = await openRvfStore(safeParent);
+          child = await rvfBranch(parent, safeChild);
+          return { content: [{ type: 'text', text: JSON.stringify({
+            success: true,
+            parent: safeParent,
+            child: safeChild,
+            durable: true
+          }, null, 2) }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
+        } finally {
+          const { rvfClose } = require('../dist/core/rvf-wrapper.js');
+          await Promise.allSettled([child && rvfClose(child), parent && rvfClose(parent)]);
+        }
+      }
+
+      case 'rvf_freeze': {
+        let store;
+        try {
+          const safePath = validateRvfPath(args.path);
+          const { openRvfStore, rvfFreeze } = require('../dist/core/rvf-wrapper.js');
+          store = await openRvfStore(safePath);
+          const epoch = await rvfFreeze(store);
+          return { content: [{ type: 'text', text: JSON.stringify({
+            success: true,
+            path: safePath,
+            epoch
+          }, null, 2) }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
+        } finally {
+          if (store) {
+            const { rvfClose } = require('../dist/core/rvf-wrapper.js');
+            await Promise.allSettled([rvfClose(store)]);
+          }
         }
       }
 
@@ -3302,16 +3651,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ── Brain Tool Handlers ─────────────────────────────────────────────
       case 'brain_search': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.search !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const results = await client.search(args.query, { limit: args.limit || 10, category: args.category });
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...results }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3319,16 +3666,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_share': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.share !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.share({ title: args.title, content: args.content, category: args.category || 'pattern', tags: args.tags });
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3336,16 +3681,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_get': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.get !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.get(args.id);
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3353,16 +3696,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_vote': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.vote !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.vote(args.id, args.direction);
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3370,16 +3711,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_list': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.list !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const results = await client.list({ category: args.category, limit: args.limit || 20 });
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...results }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3387,16 +3726,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_delete': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.delete !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.delete(args.id);
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3404,16 +3741,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_status': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.status !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.status();
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3421,16 +3756,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_drift': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.drift !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.drift({ domain: args.domain });
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3438,16 +3771,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_partition': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.partition !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.partition({ domain: args.domain, min_cluster_size: args.min_cluster_size || 3 });
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3455,16 +3786,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_transfer': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.transfer !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.transfer(args.source, args.target);
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3472,16 +3801,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'brain_sync': {
         try {
-          const piBrain = require('@ruvector/pi-brain');
-          const PiBrainClient = piBrain.PiBrainClient || piBrain.default;
-          const url = process.env.BRAIN_URL || 'https://pi.ruv.io';
-          const key = process.env.PI || '';
-          const client = new PiBrainClient({ url, key });
+          const { client, missing } = loadBrainClient();
+          if (missing) return BRAIN_MISSING_DEP_RESULT;
+          if (typeof client.sync !== 'function') return BRAIN_MISSING_DEP_RESULT;
           const result = await client.sync({ direction: args.direction || 'both' });
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           if (e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-            return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Brain tools require @ruvector/pi-brain', hint: 'npm install @ruvector/pi-brain' }, null, 2) }] };
+            return BRAIN_MISSING_DEP_RESULT;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
         }
@@ -3837,18 +4164,30 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 // Start server
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('RuVector MCP server running on stdio');
-
   // Exit cleanly when the parent process closes the stdio pipe or sends a
   // termination signal. Without these handlers, the MCP server can survive
   // the parent's death (e.g. when the client is killed with SIGKILL) and
   // accumulate as an orphaned process under PPID=1, consuming RSS for the
-  // lifetime of the user session.
-  process.stdin.on('end', () => process.exit(0));
+  // lifetime of the user session. Registered BEFORE the (async) transport
+  // connect: a signal arriving during startup previously hit the default
+  // handler and died with a non-zero code — a race that made the
+  // sigterm-cleanup suite flaky (SIGTERM and SIGINT failed alternately on
+  // CI depending on which spawn won the 2s ready-wait).
   process.on('SIGINT', () => process.exit(0));
   process.on('SIGTERM', () => process.exit(0));
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('RuVector MCP server running on stdio');
+
+  process.stdin.on('end', () => process.exit(0));
 }
 
-main().catch(console.error);
+module.exports = { main, loadBrainClient, BRAIN_MISSING_DEP_RESULT };
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

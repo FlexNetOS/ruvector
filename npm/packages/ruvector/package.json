@@ -1,18 +1,18 @@
 {
   "name": "ruvector",
-  "version": "0.2.26",
-  "description": "Self-learning vector database for Node.js — hybrid search, Graph RAG, FlashAttention-3, HNSW, 50+ attention mechanisms",
+  "version": "0.2.39",
+  "description": "Self-learning vector database for Node.js \u2014 hybrid search, Graph RAG, FlashAttention-3, HNSW, 50+ attention mechanisms",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "ruvector": "./bin/cli.js"
+    "ruvector": "bin/cli.js"
   },
   "scripts": {
-    "build": "tsc && mkdir -p dist/core/onnx/pkg && cp -r src/core/onnx/pkg/. dist/core/onnx/pkg/",
+    "build": "tsc && node -e \"require('fs').cpSync('src/core/onnx','dist/core/onnx',{recursive:true})\"",
     "verify-dist": "node scripts/verify-dist.js",
     "prepack": "npm run build && npm run verify-dist",
     "prepublishOnly": "npm run build && npm run verify-dist",
-    "test": "node test/integration.js && node test/cli-commands.js && node test/sigterm-cleanup.js"
+    "test": "node test/integration.js && node test/cli-commands.js && node test/db-workflow.js && node test/mcp-stdio.js && node test/sigterm-cleanup.js && node test/mcp-policy.js && node test/mcp-command-security.js && node test/mcp-handshake.js && node test/startup-budget.js"
   },
   "keywords": [
     "vector",
@@ -67,22 +67,22 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/FlexNetOS/ruvector.git",
+    "url": "git+https://github.com/FlexNetOS/ruvector.git",
     "directory": "npm/packages/ruvector"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@ruvector/attention": "^0.1.3",
     "@ruvector/core": "^0.1.25",
     "@ruvector/gnn": "^0.1.22",
     "@ruvector/sona": "^0.1.4",
     "chalk": "^4.1.2",
     "commander": "^11.1.0",
-    "js-beautify": "^1.15.4",
     "ora": "^5.4.1"
   },
   "optionalDependencies": {
-    "@ruvector/rvf": "^0.1.0"
+    "@ruvector/rvf": "^0.1.0",
+    "@ruvector/tiny-dancer": "^0.1.22"
   },
   "devDependencies": {
     "@types/node": "^20.10.5",
@@ -92,6 +92,7 @@
     "bin/",
     "dist/",
     "src/decompiler/",
+    "src/optimizer/",
     "wasm/",
     "README.md",
     "LICENSE"

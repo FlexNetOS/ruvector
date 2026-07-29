@@ -69,7 +69,7 @@ npx ruvector hooks init --pretrain --build-agents quality
 
 ### MCP Server Integration
 
-RuVector includes an MCP server for Claude Code with 103 tools:
+RuVector includes an MCP server for Claude Code with 97 tools:
 
 ```bash
 # Add to Claude Code
@@ -86,10 +86,43 @@ claude mcp add ruvector -- npx ruvector mcp start
 - `hooks_rag_context` — Semantic context retrieval
 - `hooks_attention_info`, `hooks_gnn_info` — Neural capabilities
 - `brain_search`, `brain_share`, `brain_status` — Shared brain knowledge
-- `brain_agi_status`, `brain_sona_stats`, `brain_temporal`, `brain_explore` — AGI diagnostics
-- `brain_midstream`, `brain_flags` — Midstream platform + feature flags
-- `midstream_status`, `midstream_attractor`, `midstream_scheduler` — Streaming analysis
-- `midstream_benchmark`, `midstream_search`, `midstream_health` — Latency benchmarks + health
+- `decompile_package`, `decompile_file`, `decompile_url` — Package/file decompilation + witness
+- `edge_status`, `edge_join`, `edge_balance` — Edge cluster coordination
+- `identity_generate`, `identity_show` — Agent identity
+
+See `npx ruvector mcp tools` for the full, authoritative tool list.
+
+**MCP tool-access policy (default-deny, ADR-256):** restrict the exposed/callable
+tool surface with environment variables — useful for least-privilege deployments.
+
+```bash
+# Only expose specific tools (everything else is denied)
+RUVECTOR_MCP_ALLOW="hooks_route,hooks_recall" npx ruvector mcp start
+
+# Block specific tools (deny wins over allow)
+RUVECTOR_MCP_DENY="hooks_force_learn" npx ruvector mcp start
+
+# Apply a curated read-only profile (safe, non-mutating subset)
+RUVECTOR_MCP_PROFILE=readonly npx ruvector mcp start
+```
+
+Precedence is **DENY > ALLOW/PROFILE > allow-all**. With no policy set, all tools
+are available (backward compatible). Inspect the active posture with
+`npx ruvector harness status --json` (see `mcp.accessControl`).
+
+### Harness Router (ADR-256)
+
+`ruvector harness` surfaces the unified routing/agentic primitives ruvector ships —
+cost-optimal model routing (Tiny Dancer), semantic routing, hooks routing, the MCP
+server, witness-signed provenance, and SONA memory — in one place:
+
+```bash
+npx ruvector harness status          # human-readable surface + availability
+npx ruvector harness status --json   # structured, for tooling/CI
+```
+
+Memory + learning loops use a stable namespace (default `ruvector`), overridable per
+deployment with `RUVECTOR_MEMORY_NAMESPACE` and reported under `memory.namespace`.
 
 ### Brain AGI Commands
 

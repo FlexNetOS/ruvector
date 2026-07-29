@@ -1,5 +1,9 @@
 [workspace]
-exclude = ["crates/micro-hnsw-wasm", "crates/ruvector-hyperbolic-hnsw", "crates/ruvector-hyperbolic-hnsw-wasm", "examples/ruvLLM/esp32", "examples/ruvLLM/esp32-flash", "examples/edge-net", "examples/data", "examples/ruvLLM", "examples/delta-behavior", "crates/rvf", "crates/rvf/*", "crates/rvf/*/*", "examples/rvf-desktop", "crates/mcp-brain-server",
+exclude = ["external/ruqu", "external/rvdna", "examples/OSpipe", "examples/rvf", "crates/micro-hnsw-wasm", "crates/ruvector-hyperbolic-hnsw", "crates/ruvector-hyperbolic-hnsw-wasm", "examples/ruvLLM/esp32", "examples/ruvLLM/esp32-flash", "examples/edge-net", "examples/data", "examples/ruvLLM", "examples/delta-behavior", "crates/rvf", "crates/rvf/*", "crates/rvf/*/*", "examples/rvf-desktop", "crates/mcp-brain-server",
+    # emergent-time-wasm: standalone cdylib with own opt-level=z, panic=abort
+    "crates/emergent-time-wasm",
+    # sonic-ct crates: self-contained detached workspaces
+    "crates/sonic-ct", "crates/sonic-ct-wasm",
     # ruvector-postgres is a pgrx-based PostgreSQL extension. Its build script
     # requires `$PGRX_HOME` set up via `cargo install cargo-pgrx --version 0.12.9`
     # and `cargo pgrx init`, which downloads and builds multiple Postgres
@@ -28,10 +32,14 @@ exclude = ["crates/micro-hnsw-wasm", "crates/ruvector-hyperbolic-hnsw", "crates/
     # the workspace. See crates/ruvector-cognitum-host/README.md.
     "crates/ruvector-cognitum-host"]
 members = [
+    "crates/ruvector-bounded-rag",
+    "crates/ruvector-temporal-coherence",
     "crates/ruvector-acorn",
     "crates/ruvector-acorn-wasm",
+    "crates/ruvector-coherence-hnsw",
     "crates/ruvector-rabitq",
     "crates/ruvector-rabitq-wasm",
+    "crates/ruvector-turbovec",
     "crates/ruvector-rulake",
     "crates/ruvector-core",
     "crates/ruvector-node",
@@ -57,6 +65,8 @@ members = [
     "crates/ruvector-graph-node",
     "crates/ruvector-graph-wasm",
     "crates/ruvector-gnn",
+    "crates/ruvector-proof-gate",
+    "crates/ruvector-gnn-rerank",
     "crates/ruvector-gnn-node",
     "crates/ruvector-gnn-wasm",
     "crates/ruvector-attention",
@@ -104,7 +114,6 @@ members = [
     "crates/mcp-gate",
     "crates/mcp-brain",
     "crates/mcp-brain-server",
-    "crates/ruQu",
     "crates/ruvllm",
     "crates/ruvllm-cli",
     "crates/ruvllm-wasm",
@@ -116,17 +125,11 @@ members = [
     "crates/ruvector-delta-consensus",
     "crates/ruvector-crv",
     "crates/ruvector-temporal-tensor",
-    "crates/ruqu-core",
-    "crates/ruqu-algorithms",
-    "crates/ruqu-wasm",
-    "crates/ruqu-exotic",
     "crates/ruvector-domain-expansion",
     "crates/ruvector-domain-expansion-wasm",
     "crates/ruvector-solver",
     "crates/ruvector-solver-wasm",
     "crates/ruvector-solver-node",
-    "examples/dna",
-    "examples/OSpipe",
     "crates/ruvector-coherence",
     "crates/ruvector-profiler",
     "crates/ruvector-attn-mincut",
@@ -181,6 +184,10 @@ members = [
     "examples/a2a-swarm",
     # ETL pipeline example
     "examples/train-discoveries",
+    # RuView SkyGraph appliance core (ADR-199 Phases 1-4, synthetic ADS-B)
+    "examples/sky-monitor",
+    # Browser-facing WASM projection engine for the SkyGraph dashboard (ADR-199 presentation plane)
+    "examples/sky-monitor/wasm",
     # Spectral graph sparsification
     "crates/ruvector-sparsifier",
     "crates/ruvector-sparsifier-wasm",
@@ -243,6 +250,48 @@ members = [
     "crates/ruvllm_retrieval_diffusion",
     # RAIRS IVF: Redundant Assignment + Amplified Inverse Residual (ADR-193)
     "crates/ruvector-rairs",
+    # Hybrid sparse-dense search: BM25 + ANN + RRF / RSF / ScoreFusion (ADR-256)
+    "crates/ruvector-hybrid",
+    # LSM-ANN: write-optimized streaming vector index for agent memory (ADR-264)
+    "crates/ruvector-lsm-ann",
+    # Structure-preserving graph condensation via dynamic min-cut communities
+    "crates/ruvector-graph-condense",
+    "crates/ruvector-graph-condense-wasm",
+    # Perception substrate: delta -> boundary -> coherence -> proof -> action
+    "crates/ruvector-perception",
+    # Calculus of emergent / relational time (Wheeler-DeWitt, Page-Wootters,
+    # entropic, thermal) + Structural Proper Time for agentic systems.
+    "crates/emergent-time",
+    # PhotonLayer: learned optical-frontend computing simulator (ADR-260)
+    "crates/photonlayer-core",
+    "crates/photonlayer-bench",
+    "crates/photonlayer-ruvector",
+    "crates/photonlayer-cli",
+    "crates/photonlayer-wasm",
+    # Matryoshka coarse-to-fine ANN search: three-variant funnel with recall/latency tradeoffs (ADR-264)
+    "crates/ruvector-matryoshka",
+    # PQ-ADC: Product Quantization with Asymmetric Distance Computation (64× compression)
+    "crates/ruvector-pq-search",
+    # SOTA benchmark suite (ADR-265)
+    "crates/ruvector-sota-bench",
+    # Capability-gated ANN: per-vector read access control with bitset tokens (ADR-268)
+    "crates/ruvector-capgated",
+    # Diverse beam ANN: MMR and coherence-pruned beam search variants (ADR-272)
+    "crates/ruvector-diverse-beam",
+    # Threshold-driven ANN with empirical recall measurement (ADR-272)
+    "crates/ruvector-recall-bounded",
+    # Adaptive recall-targeted ANN: auto-calibrated ef for user-specified recall targets (ADR-272)
+    "crates/ruvector-adaptive-ann",
+    # SPANN partition spilling for boundary-safe ANN (ADR-268)
+    "crates/ruvector-spann",
+    # ColBERT-style multi-vector MaxSim late-interaction search
+    "crates/ruvector-maxsim",
+    # TimesFM 1.0 200M decoder-only patched time-series Transformer (candle, ADR-189/191)
+    "crates/timesfm",
+    # RuVector integration for TimesFM: Forecaster + anomaly bands + sweep early-stopping
+    "crates/ruvector-timesfm",
+    # Speculative ANN search: draft-verify with adaptive candidate multiplier (ADR-272)
+    "crates/ruvector-speculative-ann",
 ]
 resolver = "2"
 
@@ -250,7 +299,7 @@ resolver = "2"
 unused_unit = "allow"
 
 [workspace.package]
-version = "2.2.3"
+version = "2.3.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"

@@ -1,6 +1,6 @@
 [package]
 name = "ruvector-graph"
-version.workspace = true
+version = "2.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -155,6 +155,10 @@ path = "examples/test_cypher_parser.rs"
 
 [[bench]]
 name = "new_capabilities_bench"
+harness = false
+
+[[bench]]
+name = "typed_graph_bench"
 harness = false
 
 [lib]

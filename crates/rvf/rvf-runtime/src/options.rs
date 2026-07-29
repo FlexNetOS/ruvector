@@ -19,6 +19,35 @@ pub enum DistanceMetric {
     Cosine,
 }
 
+impl DistanceMetric {
+    /// Encode this metric as a single byte for manifest persistence.
+    ///
+    /// Encoding: 0 = L2 (default / backward-compatible), 1 = InnerProduct, 2 = Cosine.
+    /// Old manifests written before this field existed have 0x00 at that byte
+    /// (it was a reserved zero), so they boot correctly as L2.
+    pub(crate) fn to_id(self) -> u8 {
+        match self {
+            DistanceMetric::L2 => 0,
+            DistanceMetric::InnerProduct => 1,
+            DistanceMetric::Cosine => 2,
+        }
+    }
+
+    /// Decode a metric from a manifest byte.
+    ///
+    /// Unknown values fall back to L2 for forward-compatibility: a store
+    /// written by a newer version with an unknown metric ID is treated as
+    /// L2-distance, which is at least type-safe even if not semantically
+    /// correct.
+    pub(crate) fn from_id(id: u8) -> Self {
+        match id {
+            1 => DistanceMetric::InnerProduct,
+            2 => DistanceMetric::Cosine,
+            _ => DistanceMetric::L2,
+        }
+    }
+}
+
 /// Compression profile for stored vectors.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CompressionProfile {
@@ -112,6 +141,21 @@ pub struct QueryOptions {
     /// Safety net budget caps. Callers may tighten but not loosen
     /// beyond the mode default (unless PreferQuality, which extends to 4x).
     pub safety_net_budget: SafetyNetBudget,
+    /// Force the exact brute-force scan even when an HNSW index is
+    /// available. Useful for ground-truth comparison and benchmarking.
+    pub force_exact: bool,
+    /// Opt in to the RaBitQ two-stage path: a 1-bit-code candidate scan
+    /// (~32x smaller than f32) followed by an exact f32 rescore of the
+    /// oversampled candidates. Default `false` (full-precision HNSW /
+    /// exact scan). v1 serves the L2 metric only; other metrics and
+    /// filtered/COW queries fall back to the default routing.
+    pub rabitq: bool,
+    /// Candidate oversampling factor for the RaBitQ first stage: the
+    /// binary scan collects `rabitq_oversample * k` candidates (floored
+    /// at an internal minimum pool size that keeps recall@10 >= 0.95 on
+    /// the 10k x 128 benchmark) before the exact rescore. Values below 1
+    /// are treated as 1.
+    pub rabitq_oversample: u16,
 }
 
 impl Default for QueryOptions {
@@ -122,6 +166,9 @@ impl Default for QueryOptions {
             timeout_ms: 0,
             quality_preference: QualityPreference::Auto,
             safety_net_budget: SafetyNetBudget::LAYER_A,
+            force_exact: false,
+            rabitq: false,
+            rabitq_oversample: 4,
         }
     }
 }

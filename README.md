@@ -1,4 +1,4 @@
-# RuVector — A Self-Learning, Vector Memory & Agentic Operating System
+# RuVector
 
 [![RuVector](https://repository-images.githubusercontent.com/1099547803/948d2495-1db9-47f6-9ea1-f7f977343e5f)](https://cognitum.one/ruvector)
 
@@ -4680,539 +4680,233 @@ This creates `.claude/settings.json` with hook configurations:
 }
 ```
 
-**All 7 Claude Code hooks covered:**
-| Hook | When It Fires | What RuVector Does |
-|------|---------------|-------------------|
-| `PreToolUse` | Before file edit, command, or Task | Suggests agent, shows related files, validates agent assignments |
-| `PostToolUse` | After file edit or command | Records outcome, updates Q-values, injects context |
-| `SessionStart` | When session begins/resumes | Loads intelligence, shows stats (startup vs resume) |
-| `Stop` | When session ends | Saves state, exports metrics |
-| `PreCompact` | Before context compaction | Preserves critical memories (auto vs manual) |
-| `UserPromptSubmit` | Before processing user prompt | Injects learned patterns as context |
-| `Notification` | On system notifications | Tracks notification patterns |
+## Persistent, adaptive memory for AI agents
 
-**Advanced Features:**
-- **Stdin JSON Parsing**: Hooks receive full JSON via stdin (session_id, tool_input, tool_response)
-- **Context Injection**: PostToolUse returns `additionalContext` to inject into Claude's context
-- **Timeout Optimization**: All hooks have optimized timeouts (1-5 seconds vs 60s default)
+RuVector is a Rust native memory substrate for agents that need to remember across sessions. It combines local semantic embeddings, persistent vector retrieval, graph relationships, explicit feedback learning, memory lifecycle controls, and optional shared memory.
 
-**2. Use routing for intelligent agent selection:**
+The default retrieval path runs locally. Learning happens from recorded outcomes and feedback, not from reads alone. Hosted services remain optional and create a separate data boundary.
+
+## Remember and recall in 30 seconds
+
+No database server or API key is required.
 
 ```bash
-# Route a task to the best agent
-$ ruvector hooks route "implement vector search" --file src/lib.rs
-{
-  "recommended": "rust-developer",
-  "confidence": 0.85,
-  "reasoning": "learned from 47 similar edits"
-}
+npx ruvector hooks remember --semantic --type decision \
+  "The customer requires all inference to remain in Canada."
+
+npx ruvector hooks recall --semantic --top-k 3 \
+  "Where may customer data be processed?"
 ```
 
-**3. Learn from outcomes:**
+Memory is stored under the current project and remains available to later processes. The first semantic command downloads and caches the local `all-MiniLM-L6-v2` model. Keep one embedding model and dimension per store; use `npx ruvector hooks reembed` before changing an existing store from hash to semantic embeddings. Use `npx ruvector hooks stats` to inspect the store.
+
+## Embed persistent memory in Node.js
 
 ```bash
-# Record successful outcome
-ruvector hooks learn "edit-rs-lib" "rust-developer" --reward 1.0
-
-# Record failed outcome
-ruvector hooks learn "edit-rs-lib" "typescript-dev" --reward -0.5
+npm install ruvector
 ```
 
-**4. Get error fix suggestions:**
+```javascript
+const { OnnxEmbedder, VectorDB } = require('ruvector');
 
-```bash
-$ ruvector hooks suggest-fix E0308
-{
-  "code": "E0308",
-  "type": "type_mismatch",
-  "fixes": [
-    "Check return type matches function signature",
-    "Use .into() or .as_ref() for type conversion",
-    "Verify generic type parameters"
-  ]
-}
-```
+async function main() {
+  const embedder = new OnnxEmbedder();
+  await embedder.init();
 
-#### Tutorial: Swarm Coordination
+  const db = new VectorDB({
+    dimensions: 384,
+    distanceMetric: 'cosine',
+    storagePath: './agent-memory.db',
+  });
 
-**1. Register agents:**
+  const memories = [
+    {
+      id: 'decision-1',
+      text: 'The customer requires all inference to remain in Canada.',
+      kind: 'decision',
+    },
+    {
+      id: 'episode-1',
+      text: 'The Toronto pilot passed its privacy review on Tuesday.',
+      kind: 'episode',
+    },
+    {
+      id: 'procedure-1',
+      text: 'Escalate production access through the security owner.',
+      kind: 'procedure',
+    },
+  ];
 
-```bash
-ruvector hooks swarm-register agent-1 rust-developer --capabilities "rust,async,testing"
-ruvector hooks swarm-register agent-2 typescript-dev --capabilities "ts,react,node"
-ruvector hooks swarm-register agent-3 reviewer --capabilities "review,security,performance"
-```
-
-**2. Record coordination patterns:**
-
-```bash
-# Agent-1 hands off to Agent-3 for review
-ruvector hooks swarm-coordinate agent-1 agent-3 --weight 0.9
-```
-
-**3. Optimize task distribution:**
-
-```bash
-$ ruvector hooks swarm-optimize "implement-api,write-tests,code-review"
-{
-  "assignments": {
-    "implement-api": "agent-1",
-    "write-tests": "agent-1",
-    "code-review": "agent-3"
+  for (const memory of memories) {
+    const vector = await embedder.embedPassage(memory.text);
+    await db.insert({
+      id: memory.id,
+      vector,
+      metadata: {
+        text: memory.text,
+        kind: memory.kind,
+        tenant: 'acme',
+        createdAt: Date.now(),
+      },
+    });
   }
+
+  const query = await embedder.embedQuery(
+    'Where may the customer data be processed?',
+  );
+
+  const results = await db.search({
+    vector: query,
+    k: 3,
+    filter: { tenant: 'acme' },
+  });
+
+  console.log(results.map(({ score, metadata }) => ({ score, ...metadata })));
 }
+
+main().catch(console.error);
 ```
 
-**4. Handle failures with self-healing:**
+Reopen the same `storagePath` in another process to recover the stored vectors, metadata, configuration, and searchability. Search `score` is a distance, so lower values are closer. See the [Node.js API](./docs/api/NODEJS_API.md) and [Rust API](./docs/api/RUST_API.md) for the complete interfaces.
+
+## The memory loop
+
+```mermaid
+flowchart TD
+    A[Capture an event, fact, or outcome] --> B[Create a local or external embedding]
+    B --> C[Persist vectors, metadata, and relationships]
+    C --> D[Recall by similarity, filters, time, or graph]
+    D --> E[Use memory in an agent decision]
+    E --> F[Record outcome and feedback]
+    F --> G[Adapt ranking or learning state]
+    G --> C
+    C --> H[Compact, snapshot, branch, or replicate]
+```
+
+RuVector provides primitives for this loop. Your application remains responsible for deciding what is worth remembering, which evidence is trusted, when a memory expires, and which actions recalled context may influence.
+
+## What memory means in RuVector
+
+Memory classes are application semantics over vectors, metadata, and graphs. The core store is general purpose. RuVector currently exposes two typed layers:
+
+1. [`ruvllm::context::AgenticMemory`](./crates/ruvllm/src/context/agentic_memory.rs) combines working, episodic, semantic, and procedural memory behind one runtime API. It is implemented, but its unified manager is currently in memory and its cross type consolidation method is not complete.
+
+2. [`ruvector-core::AgenticDB`](./crates/ruvector-core/src/agenticdb.rs) persists Reflexion episodes, skills, causal edges, learning sessions, policy state, session turns, and a hash linked witness log. Its typed memory APIs support ONNX, Candle, and API embedding providers for semantic retrieval.
+
+| Memory class | Representation | RuVector surface |
+| --- | --- | --- |
+| Working and session | Current task, scratchpad, tool cache, turns, namespace, TTL | [`WorkingMemory`](./crates/ruvllm/src/context/working_memory.rs), [`SessionStateIndex`](./crates/ruvector-core/src/agenticdb.rs) |
+| Episodic and Reflexion | Trajectory, task, action, observation, critique, outcome | [`EpisodicMemory`](./crates/ruvllm/src/context/episodic_memory.rs), [`ReflexionEpisode`](./crates/ruvector-core/src/agenticdb.rs) |
+| Semantic | Facts, confidence, source, tags, relations, collection | [`VectorDB`](./crates/ruvector-core), [`SemanticFact`](./crates/ruvllm/src/context/agentic_memory.rs) |
+| Procedural | Skills, actions, triggers, examples, policies, Q values | [`ProceduralSkill`](./crates/ruvllm/src/context/agentic_memory.rs), [`PolicyMemoryStore`](./crates/ruvector-core/src/agenticdb.rs) |
+| Causal and relational | Nodes, edges, hyperedges, Cypher paths | [`ruvector-graph`](./crates/ruvector-graph) |
+| Learning | Trajectories, rewards, adapters, EWC state | [`SONA`](./crates/sona) |
+| Shared | Contributions, provenance, voting, transfer | [`mcp-brain`](./crates/mcp-brain) |
+| Auditable | Hash linked entries, snapshots, RVF witnesses | [`WitnessLog`](./crates/ruvector-core/src/agenticdb.rs), [`ruvector-snapshot`](./crates/ruvector-snapshot), [RVF](./crates/rvf) |
+
+## Capability map
+
+### Capture and encode
+
+| Capability | What it enables | Surface |
+| --- | --- | --- |
+| Local semantic embeddings | Text memory without a per query API fee | [`OnnxEmbedder`](./docs/adr/ADR-210-default-on-semantic-embeddings-minilm.md) |
+| External embeddings | Bring an existing embedding model or provider | [`EmbeddingProvider`](./crates/ruvector-core/src/embeddings.rs) |
+| Embedding provenance | Track model, dimension, normalization, and query or passage role | [ADR 210](./docs/adr/ADR-210-default-on-semantic-embeddings-minilm.md) |
+| Batch and parallel embedding | Higher throughput during memory ingestion | [ONNX implementation](./docs/adr/ADR-210-default-on-semantic-embeddings-minilm.md) |
+
+### Persist and organize
+
+| Capability | What it enables | Surface |
+| --- | --- | --- |
+| Durable vector storage | Vectors, metadata, deletes, and restart recovery | [`ruvector-core`](./crates/ruvector-core) |
+| Unified four type runtime memory | Working, episodic, semantic, and procedural recall | [`AgenticMemory`](./crates/ruvllm/src/context/agentic_memory.rs) |
+| Typed persistent agent records | Reflexion episodes, skills, causal edges, policy state, sessions, and witness logs | [`AgenticDB`](./crates/ruvector-core/src/agenticdb.rs) |
+| HNSW and flat indexes | Approximate or exact local similarity search | [`ruvector-core`](./crates/ruvector-core/src/index) |
+| Collections and aliases | Separate schemas and namespaces by workload | [`ruvector-collections`](./crates/ruvector-collections) |
+| Graph and hypergraph storage | Explicit relationships and multi-hop memory | [`ruvector-graph`](./crates/ruvector-graph) |
+| High write ingestion | Mutable L0 memory plus background L1 and L2 compaction | [`ruvector-lsm-ann`](./crates/ruvector-lsm-ann) |
+| Edge and embedded persistence | Lightweight local vector storage through the RVF Core Profile | [`rvlite`](./crates/rvf/rvf-adapters/rvlite) |
+| PostgreSQL extension | Keep vector memory beside relational data | [`ruvector-postgres`](./crates/ruvector-postgres) |
+
+### Recall and reconstruct
+
+| Capability | Best use | Surface |
+| --- | --- | --- |
+| Dense similarity | General semantic recall | [`VectorDB::search`](./crates/ruvector-core/src/vector_db.rs) |
+| Metadata filtering | Simple structured narrowing | [`SearchQuery`](./crates/ruvector-core/src/types.rs) |
+| Sparse and dense fusion | Exact terms plus semantic meaning | [`ruvector-hybrid`](./crates/ruvector-hybrid), [ADR 256](./docs/adr/ADR-256-hybrid-sparse-dense-search.md) |
+| Predicate aware ANN | Selective filters without post filter recall collapse | [`ruvector-acorn`](./crates/ruvector-acorn) |
+| Temporal decay | Prefer recent memories when the domain changes | [`ruvector-temporal-coherence`](./crates/ruvector-temporal-coherence), [ADR 211](./docs/adr/ADR-211-temporal-coherence-agent-memory.md) |
+| Coherence gating | Prefer memories supported by related observations | [`ruvector-temporal-coherence`](./crates/ruvector-temporal-coherence) |
+| Graph reconstruction | Follow Cue, Tag, and Content associations instead of retrieving one flat chunk | [MRAgent example](./examples/mragent), [ADR 269](./docs/adr/ADR-269-mragent-graph-memory-darwin-optimization.md) |
+| Multi-vector MaxSim | Late interaction over token or passage vectors | [`ruvector-maxsim`](./crates/ruvector-maxsim), [ADR 252](./docs/adr/ADR-252-multi-vector-maxsim.md) |
+| GNN reranking | Rerank a noisy candidate graph | [`ruvector-gnn-rerank`](./crates/ruvector-gnn-rerank), [ADR 194](./docs/adr/ADR-194-gnn-rerank.md) |
+| Matryoshka funnel | Coarse to fine search for truncatable embeddings | [`ruvector-matryoshka`](./crates/ruvector-matryoshka) |
+| Disk backed ANN | Move read heavy indexes toward SSD scale | [`ruvector-diskann`](./crates/ruvector-diskann) |
+
+### Learn and adapt
+
+| Capability | What changes | Trigger |
+| --- | --- | --- |
+| SONA MicroLoRA | Small adapter weights | Recorded trajectory and reward |
+| EWC++ consolidation | Protects important learned weights from catastrophic forgetting | Explicit consolidation |
+| Outcome aware routing | Policy and routing preferences | Success, failure, or quality signal |
+| GNN reranking | Candidate ordering | Training data or configured reranker |
+| Self reconstructing graph memory | Shortcut edges after successful reconstruction | Successful graph traversal |
+| Darwin optimization | Retrieval and reconstruction configuration | External benchmark and promotion gate |
+
+Reading or searching memory does not, by itself, mutate learned weights or guarantee better future results.
+
+### Consolidate, compress, and recover
+
+| Capability | What it controls | Surface |
+| --- | --- | --- |
+| LRU, LFU, and coherence compaction | Which memories survive a capacity limit | [`ruvector-agent-memory`](./crates/ruvector-agent-memory), [ADR 252](./docs/adr/ADR-252-agent-memory-compaction.md) |
+| Temporal tensor codecs | Low bit storage and temporal segment reuse | [`ruvector-temporal-tensor`](./crates/ruvector-temporal-tensor) |
+| Product quantization | Compressed candidate search with exact query vectors | [`ruvector-pq-search`](./crates/ruvector-pq-search) |
+| RaBitQ | Deterministic one bit candidate encoding and optional reranking | [`ruvector-rabitq`](./crates/ruvector-rabitq) |
+| Graph condensation | Smaller graph memory while retaining original member provenance | [`ruvector-graph-condense`](./crates/ruvector-graph-condense) |
+| Full snapshots | Serialized recovery data with compression and checksums | [`ruvector-snapshot`](./crates/ruvector-snapshot) |
+| Copy on write branches | Isolated memory experiments without full copies | [RVF](./crates/rvf) |
+| Cache consistency modes | Fresh, eventual, or frozen reads across data sources | [`ruvector-rulake`](./crates/ruvector-rulake) |
+
+The `DbOptions.quantization` field in `ruvector-core` is persisted but is not currently applied to core storage or indexes. Use a specialized compression crate when physical compression is required. See the source note in [`types.rs`](./crates/ruvector-core/src/types.rs).
+
+### Govern and distribute
+
+| Capability | What it provides | Surface |
+| --- | --- | --- |
+| Namespace isolation | Separate collections and schemas | [`ruvector-collections`](./crates/ruvector-collections) |
+| Capability gated retrieval | Per vector 64 bit read masks inside search | [`ruvector-capgated`](./crates/ruvector-capgated), [ADR 268](./docs/adr/ADR-268-capability-gated-ann.md) |
+| Tamper evident lineage | Hash linked records and witness verification | [RVF](./crates/rvf) |
+| Replication primitives | Vector clocks, local change propagation, and conflict strategies | [`ruvector-replication`](./crates/ruvector-replication) |
+| Raft primitives | Election, log, and metadata state machine components | [`ruvector-raft`](./crates/ruvector-raft) |
+| Shared collective memory | Remote contributions, search, provenance, and voting | [`mcp-brain`](./crates/mcp-brain) |
+
+## Choose a memory path
+
+| Requirement | Start with | Add when needed |
+| --- | --- | --- |
+| Local agent or coding memory | `npx ruvector hooks` | ONNX semantic mode, MCP |
+| Embedded Node.js service | `ruvector` and `VectorDB` | Graph, SONA, snapshots |
+| Embedded Rust service | `ruvector-core` | Specialized retrieval crates |
+| Typed in-process agent memory | `ruvllm::context::AgenticMemory` | External persistence and consolidation policy |
+| High write event stream | `ruvector-lsm-ann` | Snapshot and compaction policy |
+| Multi-hop enterprise knowledge | `ruvector-graph` | Hybrid cue search and reconstruction harness |
+| Recency sensitive memory | `ruvector-temporal-coherence` | Learned half-life after domain evaluation |
+| Memory constrained edge node | `ruvector-pq-search` or `ruvector-rabitq` | Exact reranking for critical recalls |
+| Existing lake or warehouse | `ruvector-rulake` | RVF witness bundles |
+| PostgreSQL estate | `ruvector-postgres` | Build and operate with `pgrx` separately |
+| Cross-agent shared memory | `mcp-brain` | Explicit hosted data policy and trust controls |
+
+## Agent integration
+
+For automated agent integration, install and pin the package locally:
 
 ```bash
-# Mark agent as failed and redistribute
-ruvector hooks swarm-heal agent-2
-```
-
-#### PostgreSQL Storage (Optional)
-
-For production deployments, use PostgreSQL instead of JSON files:
-
-```bash
-# Set connection URL
-export RUVECTOR_POSTGRES_URL="postgres://user:pass@localhost/ruvector"
-
-# Initialize PostgreSQL schema (automatic)
-ruvector hooks init --postgres
-
-# Or apply schema manually
-psql $RUVECTOR_POSTGRES_URL -f crates/ruvector-cli/sql/hooks_schema.sql
-
-# Build CLI with postgres feature
-cargo build -p ruvector-cli --features postgres
-```
-
-The PostgreSQL backend provides:
-- Vector embeddings with native `ruvector` type
-- Q-learning functions (`ruvector_hooks_update_q`, `ruvector_hooks_best_action`)
-- Swarm coordination tables with foreign key relationships
-- Automatic memory cleanup (keeps last 5000 entries)
-
-</details>
-
----
-
-## Additional Modules
-
-<details>
-<summary>🔬 Scientific OCR (SciPix)</summary>
-
-| Package | Description | Install |
-|---------|-------------|---------|
-| [ruvector-scipix](./examples/scipix) | Rust OCR engine for scientific documents | `cargo add ruvector-scipix` |
-| [@ruvector/scipix](https://www.npmjs.com/package/@ruvector/scipix) | TypeScript client for SciPix API | `npm install @ruvector/scipix` |
-
-**SciPix** extracts text and mathematical equations from images, converting them to LaTeX, MathML, or plain text.
-
-**Features:**
-- **Multi-format output** — LaTeX, MathML, AsciiMath, plain text, structured JSON
-- **Batch processing** — Process multiple images with parallel execution
-- **Content detection** — Equations, tables, diagrams, mixed content
-- **Confidence scoring** — Per-region confidence levels (high/medium/low)
-- **PDF support** — Extract from multi-page PDFs with page selection
-
-```typescript
-import { SciPixClient, OutputFormat } from '@ruvector/scipix';
-
-const client = new SciPixClient({
-  baseUrl: 'http://localhost:8080',
-  apiKey: 'your-api-key',
-});
-
-// OCR an image file
-const result = await client.ocrFile('./equation.png', {
-  formats: [OutputFormat.LaTeX, OutputFormat.MathML],
-  detectEquations: true,
-});
-
-console.log('LaTeX:', result.latex);
-console.log('Confidence:', result.confidence);
-
-// Quick LaTeX extraction
-const latex = await client.extractLatex('./math.png');
-
-// Batch processing
-const batchResult = await client.batchOcr({
-  images: [
-    { source: 'base64...', id: 'eq1' },
-    { source: 'base64...', id: 'eq2' },
-  ],
-  defaultOptions: { formats: [OutputFormat.LaTeX] },
-});
-```
-
-```bash
-# Rust CLI usage
-scipix-cli ocr --input equation.png --format latex
-scipix-cli serve --port 3000
-
-# MCP server for Claude/AI assistants
-scipix-cli mcp
-claude mcp add scipix -- scipix-cli mcp
-```
-
-See [npm/packages/scipix/README.md](./npm/packages/scipix/README.md) for full documentation.
-
-</details>
-
-<details>
-<summary>🔗 ONNX Embeddings</summary>
-
-| Example | Description | Path |
-|---------|-------------|------|
-| [ruvector-onnx-embeddings](./examples/onnx-embeddings) | Production-ready ONNX embedding generation in pure Rust | `examples/onnx-embeddings` |
-
-**ONNX Embeddings** provides native embedding generation using ONNX Runtime — no Python required. Supports 8+ pretrained models (all-MiniLM, BGE, E5, GTE), multiple pooling strategies, GPU acceleration (CUDA, TensorRT, CoreML, WebGPU), and direct RuVector index integration for RAG pipelines.
-
-```rust
-use ruvector_onnx_embeddings::{Embedder, PretrainedModel};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Create embedder with default model (all-MiniLM-L6-v2)
-    let mut embedder = Embedder::default_model().await?;
-
-    // Generate embedding (384 dimensions)
-    let embedding = embedder.embed_one("Hello, world!")?;
-
-    // Compute semantic similarity
-    let sim = embedder.similarity(
-        "I love programming in Rust",
-        "Rust is my favorite language"
-    )?;
-    println!("Similarity: {:.4}", sim); // ~0.85
-
-    Ok(())
-}
-```
-
-**Supported Models:**
-| Model | Dimension | Speed | Best For |
-|-------|-----------|-------|----------|
-| `AllMiniLmL6V2` | 384 | Fast | General purpose (default) |
-| `BgeSmallEnV15` | 384 | Fast | Search & retrieval |
-| `AllMpnetBaseV2` | 768 | Accurate | Production RAG |
-
-</details>
-
-<details>
-<summary>🔧 Bindings & Tools</summary>
-
-**Native bindings and tools** for integrating RuVector into any environment — Node.js, browsers, CLI, or as an HTTP/gRPC server.
-
-| Crate | Description | crates.io |
-|-------|-------------|-----------|
-| [ruvector-node](./crates/ruvector-node) | Native Node.js bindings via napi-rs | [![crates.io](https://img.shields.io/crates/v/ruvector-node.svg)](https://crates.io/crates/ruvector-node) |
-| [ruvector-wasm](./crates/ruvector-wasm) | WASM bindings for browsers & edge | [![crates.io](https://img.shields.io/crates/v/ruvector-wasm.svg)](https://crates.io/crates/ruvector-wasm) |
-| [ruvllm-wasm](./crates/ruvllm-wasm) | Browser LLM inference with WebGPU | [![crates.io](https://img.shields.io/crates/v/ruvllm-wasm.svg)](https://crates.io/crates/ruvllm-wasm) |
-| [ruvector-cli](./crates/ruvector-cli) | Command-line interface | [![crates.io](https://img.shields.io/crates/v/ruvector-cli.svg)](https://crates.io/crates/ruvector-cli) |
-| [ruvector-server](./crates/ruvector-server) | HTTP/gRPC server | [![crates.io](https://img.shields.io/crates/v/ruvector-server.svg)](https://crates.io/crates/ruvector-server) |
-
-**Node.js (Native Performance)**
-```bash
-npm install @ruvector/node
-```
-```javascript
-const { RuVector } = require('@ruvector/node');
-const db = new RuVector({ dimensions: 1536 });
-db.insert('doc1', embedding, { title: 'Hello' });
-const results = db.search(queryEmbedding, 10);
-```
-
-**Browser (WASM)**
-```bash
-npm install @ruvector/wasm
-```
-```javascript
-import { RuVectorWasm } from '@ruvector/wasm';
-const db = await RuVectorWasm.create({ dimensions: 384 });
-await db.insert('doc1', embedding);
-const results = await db.search(query, 5);
-```
-
-**CLI**
-```bash
-cargo install ruvector-cli
-ruvector init mydb --dim 1536
-ruvector insert mydb --file embeddings.json
-ruvector search mydb --query "[0.1, 0.2, ...]" --limit 10
-```
-
-**HTTP Server**
-```bash
-cargo install ruvector-server
-ruvector-server --port 8080 --data ./vectors
-
-# REST API
-curl -X POST http://localhost:8080/search \
-  -H "Content-Type: application/json" \
-  -d '{"vector": [0.1, 0.2, ...], "limit": 10}'
-```
-
-</details>
-
----
-
-## Examples & Tutorials
-
-<details>
-<summary>📚 Production Examples</summary>
-
-50+ production-ready examples demonstrating RuVector integration patterns.
-
-#### Boundary-First Discovery (NEW — 17 experiments, 7/7 real seizures detected)
-
-Boundary-first detection finds hidden structure by analyzing WHERE correlations change — not WHERE individual measurements cross thresholds. Validated on real clinical EEG data from PhysioNet. [Research paper](https://gist.github.com/ruvnet/1efd1af92b2d6ecd4b27c3ef8551a208) | [Seizure deep-dive](https://gist.github.com/ruvnet/10596316f4e29107b296568f1ff57045)
-
-| Example | Description | Key Result |
-|---------|-------------|------------|
-| [boundary-discovery](./examples/boundary-discovery) | Phase transition detection proof | z=-3.90 |
-| [brain-boundary-discovery](./examples/brain-boundary-discovery) | Seizure prediction 45s early (synthetic) | z=-32.62 |
-| [real-eeg-analysis](./examples/real-eeg-analysis) | **Real CHB-MIT EEG** seizure detection | z=-2.23, 274s warning |
-| [real-eeg-multi-seizure](./examples/real-eeg-multi-seizure) | **7/7 real seizures detected** (100%) | 225s mean warning |
-| [seizure-therapeutic-sim](./examples/seizure-therapeutic-sim) | Entrainment delays seizure 60s | +252% alpha restored |
-| [temporal-attractor-discovery](./examples/temporal-attractor-discovery) | 3/3 regime transitions found | z=-6.83 |
-| [weather-boundary-discovery](./examples/weather-boundary-discovery) | 20 days before thermometer | z=-10.85 |
-| [health-boundary-discovery](./examples/health-boundary-discovery) | 13 days before clinical thresholds | z=-3.90 |
-| [market-boundary-discovery](./examples/market-boundary-discovery) | 42 days before market crash | z=-3.90 |
-| [music-boundary-discovery](./examples/music-boundary-discovery) | Genre boundaries discovered | z=-13.01 |
-| [seti-exotic-signals](./examples/seti-exotic-signals) | 6/6 invisible signals found (trad: 0/6) | z=-8.19 |
-| [earthquake-boundary-discovery](./examples/earthquake-boundary-discovery) | 41 days before mainshock | z=-2.29 |
-| [pandemic-boundary-discovery](./examples/pandemic-boundary-discovery) | 50 days before outbreak | z=-12.31 |
-| [infrastructure-boundary-discovery](./examples/infrastructure-boundary-discovery) | 179 days before bridge collapse | z=-2.15 |
-
-#### All Examples
-
-| Example | Description | Type |
-|---------|-------------|------|
-| [**security_hardened.rvf**](./examples/security_hardened.rvf) | **Security RVF: 22 capabilities — TEE, AIDefence, eBPF, RBAC, Paranoid policy** | Rust/RVF |
-| [agentic-jujutsu](./examples/agentic-jujutsu) | Quantum-resistant version control for AI agents (23x faster than Git) | Rust |
-| [mincut](./examples/mincut) | 6 self-organizing network demos: strange loops, time crystals, causal discovery | Rust |
-| [subpolynomial-time](./examples/subpolynomial-time) | n^0.12 subpolynomial algorithm demos | Rust |
-| [exo-ai-2025](./examples/exo-ai-2025) | Cognitive substrate with 9 neural-symbolic crates + 11 research experiments | Rust/TS |
-| [neural-trader](./examples/neural-trader) | AI trading with DRL + sentiment analysis + SONA learning | Rust |
-| [ultra-low-latency-sim](./examples/ultra-low-latency-sim) | 13+ quadrillion meta-simulations/sec with SIMD | Rust |
-| [meta-cognition-spiking-neural-network](./examples/meta-cognition-spiking-neural-network) | Spiking neural network with meta-cognitive learning (10-50x speedup) | npm |
-| [spiking-network](./examples/spiking-network) | Biologically-inspired spiking neural networks | Rust |
-| [ruvLLM](./examples/ruvLLM) | LLM integration patterns for RAG and AI agents | Rust |
-| [onnx-embeddings](./examples/onnx-embeddings) | Production ONNX embedding generation without Python | Rust |
-| [onnx-embeddings-wasm](./examples/onnx-embeddings-wasm) | WASM ONNX embeddings for browsers | WASM |
-| [refrag-pipeline](./examples/refrag-pipeline) | RAG pipeline with vector search and document processing | Rust |
-| [scipix](./examples/scipix) | Scientific OCR: equations → LaTeX/MathML with ONNX inference | Rust |
-| [graph](./examples/graph) | Graph database examples with Cypher queries | Rust |
-| [edge](./examples/edge) | 364KB WASM edge deployment | Rust |
-| [edge-full](./examples/edge-full) | Full-featured edge vector DB | Rust |
-| [edge-net](./examples/edge-net) | Networked edge deployment with zero-cost swarms | Rust |
-| [vibecast-7sense](./examples/vibecast-7sense) | 7-sense perception AI application | TypeScript |
-| [apify](./examples/apify) | 13 Apify actors: trading, memory engine, synth data, market research | npm |
-| [google-cloud](./examples/google-cloud) | GCP templates for Cloud Run, GKE, Vertex AI | Terraform |
-| [wasm-react](./examples/wasm-react) | React integration with WASM vector operations | WASM |
-| [wasm-vanilla](./examples/wasm-vanilla) | Vanilla JS WASM example for browser vector search | WASM |
-| [wasm](./examples/wasm) | Core WASM examples and bindings | WASM |
-| [nodejs](./examples/nodejs) | Node.js integration examples | Node.js |
-| [rust](./examples/rust) | Core Rust usage examples | Rust |
-| [dna](./examples/dna) | rvDNA: AI-native genomic analysis, variant calling, `.rvdna` format | Rust |
-| [delta-behavior](./examples/delta-behavior) | Mathematics of systems that refuse to collapse — behavioral change tracking | Rust |
-| [data](./examples/data) | Dataset discovery framework — graph-based pattern finding in massive datasets | Rust |
-| [prime-radiant](./examples/prime-radiant) | Prime-Radiant coherence engine examples and usage demos | Rust |
-| [benchmarks](./examples/benchmarks) | Comprehensive benchmarks for temporal reasoning and vector operations | Rust |
-| [vwm-viewer](./examples/vwm-viewer) | Visual vector world model viewer (HTML Canvas) | HTML |
-| [**verified-applications**](./examples/verified-applications) | **10 exotic domains: weapons filter, medical diagnostics, financial routing, agent contracts, sensor swarm, quantization proof, AGI memory, vector signatures, simulation integrity, legal forensics** | Rust |
-| [rvf-kernel-optimized](./examples/rvf-kernel-optimized) | Verified + hyper-optimized Linux kernel RVF with proof-carrying ingest | Rust |
-
-</details>
-
-<details>
-<summary>🎓 Tutorials</summary>
-
-### Tutorial 1: Vector Search in 60 Seconds
-
-```javascript
-import { VectorDB } from 'ruvector';
-
-// Create DB with 384-dimensional vectors
-const db = new VectorDB(384);
-
-// Add vectors
-db.insert('doc1', [0.1, 0.2, ...]);  // 384 floats
-db.insert('doc2', [0.3, 0.1, ...]);
-
-// Search (returns top 5 nearest neighbors)
-const results = db.search(queryVector, 5);
-// -> [{ id: 'doc1', score: 0.95 }, { id: 'doc2', score: 0.87 }]
-```
-
-### Tutorial 2: Graph Queries with Cypher
-
-```javascript
-import { GraphDB } from 'ruvector';
-
-const graph = new GraphDB();
-
-// Create nodes and relationships
-graph.query(`
-  CREATE (a:Person {name: 'Alice', embedding: $emb1})
-  CREATE (b:Person {name: 'Bob', embedding: $emb2})
-  CREATE (a)-[:KNOWS {since: 2020}]->(b)
-`, { emb1: aliceVector, emb2: bobVector });
-
-// Hybrid query: graph traversal + vector similarity
-const results = graph.query(`
-  MATCH (p:Person)-[:KNOWS*1..3]->(friend)
-  WHERE vector.similarity(friend.embedding, $query) > 0.8
-  RETURN friend.name, vector.similarity(friend.embedding, $query) as score
-  ORDER BY score DESC
-`, { query: queryVector });
-```
-
-### Tutorial 3: Self-Learning with SONA
-
-```rust
-use ruvector_sona::{SonaEngine, SonaConfig};
-
-// Initialize SONA with LoRA adapters
-let sona = SonaEngine::with_config(SonaConfig {
-    hidden_dim: 256,
-    lora_rank: 8,
-    ewc_lambda: 0.4,  // Elastic Weight Consolidation
-    ..Default::default()
-});
-
-// Record successful action
-let mut trajectory = sona.begin_trajectory(query_embedding);
-trajectory.add_step(result_embedding, vec![], 1.0);  // reward=1.0
-sona.end_trajectory(trajectory, true);  // success=true
-
-// SONA learns and improves future predictions
-sona.force_learn();
-
-// Later: get improved predictions
-let prediction = sona.predict(&new_query_embedding);
-```
-
-### Tutorial 4: Dynamic Min-Cut (n^0.12 Updates)
-
-```rust
-use ruvector_mincut::{DynamicMinCut, Graph};
-
-// Build graph
-let mut graph = Graph::new(100);  // 100 nodes
-graph.add_edge(0, 1, 10.0);
-graph.add_edge(1, 2, 5.0);
-graph.add_edge(0, 2, 15.0);
-
-// Compute initial min-cut
-let mut mincut = DynamicMinCut::new(&graph);
-let (value, cut_edges) = mincut.compute();
-println!("Min-cut value: {}", value);  // -> 15.0
-
-// Dynamic update - subpolynomial time O(n^0.12)!
-graph.update_edge(1, 2, 20.0);
-let (new_value, _) = mincut.recompute();  // Much faster than recomputing from scratch
-```
-
-### Tutorial 5: 39 Attention Mechanisms
-
-```rust
-use ruvector_attention::{
-    Attention, FlashAttention, LinearAttention,
-    HyperbolicAttention, GraphAttention, MinCutGatedAttention
-};
-
-// FlashAttention - O(n) memory, fastest for long sequences
-let flash = FlashAttention::new(512, 8);  // dim=512, heads=8
-let output = flash.forward(&query, &key, &value);
-
-// LinearAttention - O(n) time complexity
-let linear = LinearAttention::new(512, 8);
-
-// HyperbolicAttention - for hierarchical data (Poincaré ball)
-let hyper = HyperbolicAttention::new(512, 8, Curvature(-1.0));
-
-// GraphAttention - respects graph structure
-let gat = GraphAttention::new(512, 8, &adjacency_matrix);
-
-// MinCutGatedAttention - 50% compute reduction via sparsity
-let mincut_gated = MinCutGatedAttention::new(512, 8, sparsity: 0.5);
-let sparse_output = mincut_gated.forward(&query, &key, &value);
-```
-
-### Tutorial 6: Spiking Neural Networks
-
-```javascript
-import { SpikingNetwork, HDCEncoder } from '@ruvector/spiking-neural';
-
-// High-Dimensional Computing encoder (10K-bit vectors)
-const encoder = new HDCEncoder(10000);
-const encoded = encoder.encode("hello world");
-
-// Spiking network with BTSP learning
-const network = new SpikingNetwork({
-  layers: [784, 256, 10],
-  learning: 'btsp',  // Behavioral Time-Scale Plasticity
-  threshold: 1.0
-});
-
-// Train with spike timing
-network.train(spikes, labels, { epochs: 10 });
-
-// Inference
-const output = network.forward(inputSpikes);
-```
-
-### Tutorial 7: Claude Code Hooks Integration
-
-```bash
-# 1. Initialize hooks
-npx @ruvector/cli hooks init
-
-# 2. Install into Claude settings
-npx @ruvector/cli hooks install
-
-# 3. Hooks now capture:
-#    - File edits (pre/post)
-#    - Commands (pre/post)
-#    - Sessions (start/end)
-#    - Errors and fixes
-
-# 4. Query learned patterns
-npx @ruvector/cli hooks recall "authentication error"
-# -> Returns similar past solutions
-
-# 5. Get AI routing suggestions
-npx @ruvector/cli hooks route "implement caching"
-# -> Suggests: rust-developer (confidence: 0.89)
-```
-
-### Tutorial 8: Edge Deployment with rvLite
-
-```javascript
-import { RvLite } from '@ruvector/rvlite';
-
-// Create persistent edge database (IndexedDB in browser)
-const db = await RvLite.create({
-  path: 'my-vectors.db',
-  dimensions: 384
-});
-
-// Works offline - all computation local
-await db.insert('doc1', embedding1, { title: 'Hello' });
-await db.insert('doc2', embedding2, { title: 'World' });
-
-// Semantic search with metadata filtering
-const results = await db.search(queryEmbedding, {
-  limit: 10,
-  filter: { title: { $contains: 'Hello' } }
-});
-
-// Sync when online
-await db.sync('https://api.example.com/vectors');
+npm install --save-exact ruvector
+RUVECTOR_MCP_PROFILE=readonly ./node_modules/.bin/ruvector mcp start
 ```
 
 </details>
@@ -5246,202 +4940,92 @@ await db.sync('https://api.example.com/vectors');
 See [GitHub Issue #20](https://github.com/FlexNetOS/ruvector/issues/20) for multi-platform npm package roadmap.
 
 ```bash
-# Install all-in-one package
-npm install ruvector
-
-# Or install individual packages
-npm install @ruvector/core @ruvector/gnn @ruvector/graph-node
-
-# List all available packages
-npx ruvector install
+./node_modules/.bin/ruvector mcp tools
 ```
 
+Use `RUVECTOR_MCP_ALLOW` and `RUVECTOR_MCP_DENY` for an explicit tool policy. No policy preserves the broader compatibility surface, so production deployments should set one deliberately.
 
-```javascript
-const ruvector = require('ruvector');
+If you enable editor or coding hooks, inspect the generated configuration, keep the package local and pinned, and run `./node_modules/.bin/ruvector hooks verify`. Do not depend on a fresh `@latest` download inside each hook invocation.
 
-// Vector search
-const db = new ruvector.VectorDB(128);
-db.insert('doc1', embedding1);
-const results = db.search(queryEmbedding, 10);
+## Deployment surfaces
 
-// Graph queries (Cypher)
-db.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
-db.execute("MATCH (p:Person)-[:KNOWS]->(friend) RETURN friend.name");
+| Surface | Package or crate | Data boundary |
+| --- | --- | --- |
+| Node.js and TypeScript | [`ruvector`](https://www.npmjs.com/package/ruvector) | Local process and local files |
+| Rust | [`ruvector-core`](https://crates.io/crates/ruvector-core) | Local process and local files |
+| Browser | [`@ruvector/wasm`](https://www.npmjs.com/package/@ruvector/wasm) | Browser memory and browser storage |
+| HTTP service | [`ruvector-server`](./crates/ruvector-server) | Your service boundary |
+| PostgreSQL | [`ruvector-postgres`](./crates/ruvector-postgres) | Your database boundary |
+| RVF cognitive container | [`crates/rvf`](./crates/rvf) | Portable signed artifact |
+| Shared Brain | [`mcp-brain`](./crates/mcp-brain) | Optional hosted service |
 
-// GNN-enhanced search
-const layer = new ruvector.GNNLayer(128, 256, 4);
-const enhanced = layer.forward(query, neighbors, weights);
-
-// Compression (2-32x memory savings)
-const compressed = ruvector.compress(embedding, 0.3);
-
-// Tiny Dancer: AI agent routing
-const router = new ruvector.Router();
-const decision = router.route(candidates, { optimize: 'cost' });
-```
-
-</details>
-
-<details>
-<summary>🦀 Rust Usage Examples</summary>
+Native npm binaries cover glibc Linux on x64 and arm64, macOS on x64 and arm64, and Windows on x64. Browser and other environments use separate packages. The root package's fallback mode is limited when neither the native core nor RVF can load; use `@ruvector/wasm` explicitly for browser vector operations. Validate the selected backend with:
 
 ```bash
-cargo add ruvector-graph ruvector-gnn
+npx ruvector info
 ```
 
-```rust
-use ruvector_graph::{GraphDB, NodeBuilder};
-use ruvector_gnn::{RuvectorLayer, differentiable_search};
+## Security and governance
 
-let db = GraphDB::new();
+1. Treat embeddings as sensitive derivatives of source data. Apply the same classification, residency, access, and retention policy as the original content.
 
-let doc = NodeBuilder::new("doc1")
-    .label("Document")
-    .property("embedding", vec![0.1, 0.2, 0.3])
-    .build();
-db.create_node(doc)?;
+2. Collections and metadata filters organize memory; they are not a complete authorization boundary. Enforce identity and authorization in the application. Capability gated ANN is currently a research component with a 64 capability mask and documented side channel and recall limitations.
 
-// GNN layer
-let layer = RuvectorLayer::new(128, 256, 4, 0.1);
-let enhanced = layer.forward(&query, &neighbors, &weights);
-```
+3. RVF witnesses and hash linked logs are tamper evident. They do not encrypt memory content or prevent an authorized process from reading it.
 
-```rust
-use ruvector_raft::{RaftNode, RaftNodeConfig};
-use ruvector_cluster::{ClusterManager, ConsistentHashRing};
-use ruvector_replication::{SyncManager, SyncMode};
+4. A delete from the live store does not automatically remove copies in snapshots, branches, replicas, exports, or hosted memory. Define retention and erasure across every copy.
 
-// Configure a 5-node Raft cluster
-let config = RaftNodeConfig {
-    node_id: "node-1".into(),
-    cluster_members: vec!["node-1", "node-2", "node-3", "node-4", "node-5"]
-        .into_iter().map(Into::into).collect(),
-    election_timeout_min: 150,  // ms
-    election_timeout_max: 300,  // ms
-    heartbeat_interval: 50,     // ms
-};
-let raft = RaftNode::new(config);
+5. Shared Brain is a hosted plane. Review its network, identity, provenance, poisoning, and data residency controls before sending enterprise memory.
 
-// Auto-sharding with consistent hashing (150 virtual nodes per real node)
-let ring = ConsistentHashRing::new(64, 3); // 64 shards, replication factor 3
-let shard = ring.get_shard("my-vector-key");
+6. Pin and prepopulate embedding models for offline or regulated deployments. The default npm semantic path downloads its model on first use.
 
-// Multi-master replication with conflict resolution
-let sync = SyncManager::new(SyncMode::SemiSync { min_replicas: 2 });
-```
+7. Keep tool execution separate from memory retrieval. Retrieved context is untrusted input until policy checks and action authorization pass.
 
-</details>
+See [SECURITY.md](./SECURITY.md) for reporting and project security guidance.
 
+## Known boundaries
 
-<details>
-<summary>🎓 RuvLLM Training & RLM Fine-Tuning Tutorials </summary>
+1. The repository is a monorepo. Installing `ruvector` does not activate every crate in this capability map.
 
-#### Hybrid Routing (90% Accuracy)
+2. The unified four type `ruvllm::AgenticMemory` manager does not yet have native save and load support, and its episodic to semantic or procedural consolidation method currently returns no changes. Durable `VectorDB` storage and typed runtime memory are not yet one facade.
 
-RuvLTRA achieves **90% routing accuracy** using a keyword-first strategy with embedding fallback:
+3. Core metadata filtering currently narrows the retrieved candidate set. Highly selective filters may return fewer than `k` relevant results. Evaluate ACORN or an application level prefilter for selective workloads.
 
-```javascript
-// Optimal routing: Keywords first, embeddings as tiebreaker
-function routeTask(task, taskEmbedding, agentEmbeddings) {
-  const keywordScores = getKeywordScores(task);
-  const maxKw = Math.max(...Object.values(keywordScores));
+4. Opening a persisted HNSW database currently enumerates stored vectors and rebuilds the index. Measure cold start time against the intended memory size.
 
-  if (maxKw > 0) {
-    const candidates = Object.entries(keywordScores)
-      .filter(([_, score]) => score === maxKw)
-      .map(([agent]) => agent);
+5. Temporal coherence currently builds an exact pairwise coherence graph and is a proof of concept for moderate memory sets. The planned production path is an approximate neighbor graph.
 
-    if (candidates.length === 1) return { agent: candidates[0] };
-    return pickByEmbedding(candidates, taskEmbedding, agentEmbeddings);
-  }
+6. Agent memory compaction is not yet wired into the default core, MCP, or RVF persistence path.
 
-  return embeddingSimilarity(taskEmbedding, agentEmbeddings);
-}
-```
+7. Full snapshot serialization exists, but incremental snapshots, scheduling, cloud backends, and direct `VectorDB` restoration are not complete on the current main branch.
 
-Run the benchmark: `node npm/packages/ruvllm/scripts/hybrid-model-compare.js`
+8. Replication exposes local primitives and simulated transport behavior. Raft still has incomplete response transport and snapshot installation paths. These are not a complete production network replication plane.
 
-#### Generate Training Data
+9. GNN reranking, MRAgent reconstruction, and Darwin optimization are implemented research surfaces, not automatic behavior in `VectorDB::search`.
+
+10. RVF and PostgreSQL are separate build surfaces and are excluded from the default workspace build because they require their own toolchains.
+
+11. Performance depends on vector dimension, index parameters, filter selectivity, recall target, hardware, and backend. Run the included benchmark for the component and workload you intend to deploy.
+
+## Reproduce the evidence
+
+RuVector keeps benchmark code beside the implementation. These commands exercise memory relevant components without relying on unscoped cross product comparisons.
 
 ```bash
-# Using CLI (recommended)
-npx @ruvector/ruvllm train stats              # View dataset statistics
-npx @ruvector/ruvllm train dataset            # Export training data
-npx @ruvector/ruvllm train contrastive        # Run full training pipeline
+# Core vector search
+cargo bench -p ruvector-core
 
-# With options
-npx @ruvector/ruvllm train dataset --output ./my-training
-npx @ruvector/ruvllm train contrastive --epochs 20 --batch-size 32 --lr 0.0001
-```
+# High write LSM memory
+cargo run --release -p ruvector-lsm-ann --bin benchmark
 
-**Programmatic API:**
-```javascript
-import { ContrastiveTrainer, generateTrainingDataset, getDatasetStats } from '@ruvector/ruvllm';
+# Temporal and coherence weighted recall
+cargo run --release -p ruvector-temporal-coherence --bin tcd-benchmark
 
-const stats = getDatasetStats();
-console.log(`${stats.totalExamples} examples, ${stats.agentTypes} agent types`);
+# Capability gated retrieval
+cargo run --release -p ruvector-capgated --bin benchmark
 
-const trainer = new ContrastiveTrainer({ epochs: 10, margin: 0.5 });
-trainer.addTriplet(anchor, anchorEmb, positive, positiveEmb, negative, negativeEmb, true);
-const result = trainer.train();
-trainer.exportTrainingData('./output');
-```
-
-#### Fine-Tune with LoRA
-
-```bash
-pip install transformers peft datasets accelerate
-
-python -m peft.lora_train \
-  --model_name Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset ./data/training/routing-examples.jsonl \
-  --output_dir ./ruvltra-routing-lora \
-  --lora_r 8 --lora_alpha 16 \
-  --num_train_epochs 3 \
-  --learning_rate 2e-4
-```
-
-#### Convert to GGUF
-
-```bash
-# Merge LoRA weights
-python -c "
-from peft import PeftModel
-from transformers import AutoModelForCausalLM
-base = AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')
-model = PeftModel.from_pretrained(base, './ruvltra-routing-lora')
-model.merge_and_unload().save_pretrained('./ruvltra-routing-merged')
-"
-
-# Convert and quantize
-python llama.cpp/convert_hf_to_gguf.py ./ruvltra-routing-merged --outfile ruvltra-routing-f16.gguf
-./llama.cpp/llama-quantize ruvltra-routing-f16.gguf ruvltra-routing-q4_k_m.gguf Q4_K_M
-```
-
-#### Contrastive Embedding Training
-
-**Using RuvLLM CLI (recommended):**
-```bash
-# Full contrastive training pipeline with triplet loss
-npx @ruvector/ruvllm train contrastive --output ./training-output
-
-# Exports: triplets.jsonl, embeddings.json, lora_config.json, train.sh
-```
-
-**Using Python (for GPU training):**
-```python
-from sentence_transformers import SentenceTransformer, losses, InputExample
-from torch.utils.data import DataLoader
-
-train_examples = [
-    InputExample(texts=["implement login", "build auth component"], label=1.0),
-    InputExample(texts=["implement login", "write unit tests"], label=0.0),
-]
-
-model = SentenceTransformer("Qwen/Qwen2.5-0.5B-Instruct")
-train_loss = losses.CosineSimilarityLoss(model)
-model.fit([(DataLoader(train_examples, batch_size=16), train_loss)], epochs=5)
+# Matryoshka coarse to fine retrieval
+cargo run --release -p ruvector-matryoshka --bin benchmark
 ```
 
 **Resources:** [Issue #122](https://github.com/FlexNetOS/ruvector/issues/122) | [LoRA Paper](https://arxiv.org/abs/2106.09685) | [Sentence Transformers](https://www.sbert.net/docs/training/overview.html)
@@ -5453,74 +5037,31 @@ For production-scale dataset generation, use the Rust training module ([full doc
 ```rust
 use ruvllm::training::{DatasetGenerator, DatasetConfig};
 
-let config = DatasetConfig {
-    examples_per_category: 100,
-    enable_augmentation: true,
-    seed: 42,
-    ..Default::default()
-};
-
-let dataset = DatasetGenerator::new(config).generate();
-let (train, val, test) = dataset.split(0.7, 0.15, 0.15, 42);
-dataset.export_jsonl("training.jsonl")?;
-```
-
-**Features:**
-- **5 agent categories**: Coder, Researcher, Security, Architecture, Reviewer (20% each)
-- **Model routing**: Haiku (simple) → Sonnet (moderate) → Opus (complex/security)
-- **Data augmentation**: Paraphrasing, complexity variations, domain transfer
-- **8 technical domains**: Web, Systems, DataScience, Mobile, DevOps, Security, Database, API
-- **Quality scores**: 0.80-0.96 based on template quality and category
-- **Performance**: ~10,000 examples/second, ~50 MB/s JSONL export
+## Build from source
 
 ```bash
-cargo run --example generate_claude_dataset --release
-# Outputs: train.jsonl, val.jsonl, test.jsonl, stats.json
+git clone https://github.com/ruvnet/RuVector.git
+cd RuVector
+cargo test --workspace
 ```
 
-</details>
+The workspace requires Rust 1.77 or newer. RVF and PostgreSQL have separate build instructions in their component documentation.
 
----
+## Documentation
 
-## Project
-
-<details>
-<summary>📁 Project Structure</summary>
-
-```
-crates/
-├── ruvector-core/           # Vector DB engine (HNSW, storage)
-├── ruvector-graph/          # Graph DB + Cypher parser + Hyperedges
-├── ruvector-gnn/            # GNN layers, compression, training
-├── ruvector-tiny-dancer-core/  # AI agent routing (FastGRNN)
-├── ruvector-*-wasm/         # WebAssembly bindings
-├── ruvector-*-node/         # Node.js bindings (napi-rs)
-└── rvf/                     # RVF Cognitive Containers (13 crates)
-    ├── rvf-types/           #   Segment types, headers (no_std)
-    ├── rvf-runtime/         #   Store API, COW engine, compaction
-    ├── rvf-kernel/          #   Linux kernel builder
-    ├── rvf-ebpf/            #   eBPF programs (XDP/TC/socket)
-    ├── rvf-launch/          #   QEMU microvm launcher
-    ├── rvf-cli/             #   CLI with 17 subcommands
-    └── ...                  #   wire, manifest, index, quant, crypto, server, import
-```
-
-</details>
+| Topic | Link |
+| --- | --- |
+| Documentation index | [docs/INDEX.md](./docs/INDEX.md) |
+| Node.js API | [docs/api/NODEJS_API.md](./docs/api/NODEJS_API.md) |
+| Rust API | [docs/api/RUST_API.md](./docs/api/RUST_API.md) |
+| Cypher reference | [docs/api/CYPHER_REFERENCE.md](./docs/api/CYPHER_REFERENCE.md) |
+| Architecture decisions | [docs/adr](./docs/adr) |
+| Benchmarks | [docs/benchmarks](./docs/benchmarks) |
+| Repository structure | [docs/REPO_STRUCTURE.md](./docs/REPO_STRUCTURE.md) |
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](./docs/development/CONTRIBUTING.md).
-
-```bash
-# Run tests
-cargo test --workspace
-
-# Run benchmarks
-cargo bench --workspace
-
-# Build WASM
-cargo build -p ruvector-gnn-wasm --target wasm32-unknown-unknown
-```
+Contributions are welcome. Start with the [contribution guide](./docs/development/CONTRIBUTING.md). New capability claims should include an implementation link and reproducible evidence.
 
 ## License
 
@@ -5534,4 +5075,4 @@ MIT License — free for commercial and personal use.
 
 *Vector search that gets smarter over time — now shipping as cognitive containers.*
 
-</div>
+Built by [rUv](https://ruv.io) and powering [Cognitum](https://cognitum.one).

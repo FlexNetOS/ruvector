@@ -3,7 +3,7 @@
 //! Tests the core branching flow: creating a base store, deriving a child,
 //! verifying COW statistics, write coalescing, and parent immutability.
 
-use rvf_runtime::options::{DistanceMetric, RvfOptions};
+use rvf_runtime::options::{DistanceMetric, QueryOptions, RvfOptions};
 use rvf_runtime::RvfStore;
 use tempfile::TempDir;
 
@@ -381,4 +381,310 @@ fn branch_membership_filter_excludes_deleted() {
     base.close().unwrap();
 
     println!("PASS: branch_membership_filter_excludes_deleted");
+}
+
+// ===========================================================================
+// TEST 9: branch_query_reads_through_to_parent  (the COW-queryability fix)
+// ===========================================================================
+
+/// The core regression for the "COW branch is not queryable" bug.
+///
+/// Builds a 1k-vector base, branches a COW child, applies a few edits, then
+/// asserts:
+///   1. a query for a *base* vector returns it (parent read-through works,
+///      even from a child with zero local edits);
+///   2. a query for an *edited* vector returns the child's value (override
+///      wins over the inherited parent vector on an id collision);
+///   3. a brand-new vector added to the child is queryable;
+///   4. the branch file stays small — a COW delta, not a full copy.
+#[test]
+fn branch_query_reads_through_to_parent() {
+    let dir = TempDir::new().unwrap();
+    let base_path = dir.path().join("base_rt.rvf");
+    let child_path = dir.path().join("child_rt.rvf");
+    let dim: u16 = 16;
+    let n: u64 = 1000;
+
+    // Build a 1k-vector base with contiguous ids 0..n.
+    let mut base = RvfStore::create(&base_path, make_options(dim)).unwrap();
+    let vectors: Vec<Vec<f32>> = (0..n).map(|i| random_vector(dim as usize, i)).collect();
+    let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+    let ids: Vec<u64> = (0..n).collect();
+    base.ingest_batch(&refs, &ids, None).unwrap();
+    base.freeze().unwrap(); // immutable parent (correct COW usage)
+
+    // Branch a COW child.
+    let mut child = base.branch(&child_path).unwrap();
+    let opts = QueryOptions::default();
+
+    // (1) Empty-child read-through: query for a known BASE vector. Before
+    // the fix this returned nothing (only the child's own edits were
+    // searchable, and the child has none yet).
+    let base_id: u64 = 123;
+    let hits = child.query(&vectors[base_id as usize], 5, &opts).unwrap();
+    assert!(
+        !hits.is_empty(),
+        "COW child must return parent results via read-through"
+    );
+    assert_eq!(
+        hits[0].id, base_id,
+        "read-through must return the matching base vector as nearest"
+    );
+    assert!(
+        hits[0].distance < 1e-3,
+        "exact base vector should match at ~0 distance, got {}",
+        hits[0].distance
+    );
+
+    // (2) Override: re-ingest an existing base id in the child with a new
+    // value. A query for the NEW value must return that id (child wins).
+    let override_id: u64 = 200;
+    let new_val = random_vector(dim as usize, 999_999);
+    child
+        .ingest_batch(&[new_val.as_slice()], &[override_id], None)
+        .unwrap();
+
+    let hits = child.query(&new_val, 5, &opts).unwrap();
+    assert_eq!(
+        hits[0].id, override_id,
+        "child override must win over the inherited parent vector"
+    );
+    assert!(
+        hits[0].distance < 1e-3,
+        "override exact match should be ~0, got {}",
+        hits[0].distance
+    );
+
+    // The OLD parent value of override_id is no longer present, so if that
+    // id appears at all it must not match its old value at ~0 distance.
+    let old_val = &vectors[override_id as usize];
+    let hits = child.query(old_val, 5, &opts).unwrap();
+    if let Some(h) = hits.iter().find(|h| h.id == override_id) {
+        assert!(
+            h.distance > 1e-3,
+            "overridden id must not still match its OLD value at ~0"
+        );
+    }
+
+    // (3) A brand-new vector added to the child is queryable.
+    let new_id: u64 = 5000;
+    let added = random_vector(dim as usize, 424_242);
+    child
+        .ingest_batch(&[added.as_slice()], &[new_id], None)
+        .unwrap();
+    let hits = child.query(&added, 5, &opts).unwrap();
+    assert_eq!(
+        hits[0].id, new_id,
+        "newly added child vector must be queryable"
+    );
+
+    // Base vector is still reachable after the child's edits.
+    let hits = child.query(&vectors[base_id as usize], 3, &opts).unwrap();
+    assert_eq!(
+        hits[0].id, base_id,
+        "base vector must remain reachable after child edits"
+    );
+
+    // (4) Branch stays small: a COW delta, not a full copy.
+    child.close().unwrap();
+    base.close().unwrap();
+    let base_size = std::fs::metadata(&base_path).unwrap().len();
+    let child_size = std::fs::metadata(&child_path).unwrap().len();
+    assert!(
+        child_size.saturating_mul(10) < base_size,
+        "COW branch ({child_size} B) must be far smaller than base ({base_size} B)"
+    );
+
+    println!(
+        "PASS: branch_query_reads_through_to_parent -- base={base_size} B, child={child_size} B"
+    );
+}
+
+/// Membership bitmaps are keyed by vector ID, so count-based capacity drops
+/// normal one-based and sparse IDs even though the vectors exist.
+#[test]
+fn branch_query_reads_one_based_and_sparse_parent_ids() {
+    let dir = TempDir::new().unwrap();
+    let base_path = dir.path().join("base_sparse.rvf");
+    let child_path = dir.path().join("child_sparse.rvf");
+    let dim: u16 = 4;
+    let one_based = vec![1.0, 0.0, 0.0, 0.0];
+    let sparse = vec![0.0, 1.0, 0.0, 0.0];
+
+    let mut base = RvfStore::create(&base_path, make_options(dim)).unwrap();
+    base.ingest_batch(
+        &[one_based.as_slice(), sparse.as_slice()],
+        &[1, 10_000],
+        None,
+    )
+    .unwrap();
+    base.freeze().unwrap();
+
+    let child = base.branch(&child_path).unwrap();
+    let opts = QueryOptions::default();
+    assert_eq!(child.query(&one_based, 1, &opts).unwrap()[0].id, 1);
+    assert_eq!(child.query(&sparse, 1, &opts).unwrap()[0].id, 10_000);
+
+    child.close().unwrap();
+    base.close().unwrap();
+}
+
+/// A hostile sparse ID must fail branch creation instead of overflowing or
+/// attempting an unbounded dense-bitmap allocation.
+#[test]
+fn branch_rejects_unbounded_membership_capacity() {
+    let dir = TempDir::new().unwrap();
+    let base_path = dir.path().join("base_hostile_id.rvf");
+    let child_path = dir.path().join("child_hostile_id.rvf");
+    let vector = vec![1.0, 0.0, 0.0, 0.0];
+
+    let mut base = RvfStore::create(&base_path, make_options(4)).unwrap();
+    base.ingest_batch(&[vector.as_slice()], &[u64::MAX], None)
+        .unwrap();
+    base.freeze().unwrap();
+
+    assert!(matches!(
+        base.branch(&child_path),
+        Err(rvf_types::RvfError::Code(
+            rvf_types::ErrorCode::MembershipInvalid
+        ))
+    ));
+    base.close().unwrap();
+}
+
+// ===========================================================================
+// TEST 10: branch_state_survives_reopen_and_relocation
+// ===========================================================================
+
+/// Persist the complete COW state, move the parent/child pair together, and
+/// verify inherited vectors, child edits, and tombstones after cold reopen.
+#[test]
+fn branch_state_survives_reopen_and_relocation() {
+    let dir = TempDir::new().unwrap();
+    let bundle = dir.path().join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    let base_path = bundle.join("parent.rvf");
+    let child_path = bundle.join("child.rvf");
+    let dim: u16 = 4;
+    let parent_vectors = [
+        vec![1.0, 0.0, 0.0, 0.0],
+        vec![0.0, 1.0, 0.0, 0.0],
+        vec![0.0, 0.0, 1.0, 0.0],
+    ];
+
+    let mut parent = RvfStore::create(&base_path, make_options(dim)).unwrap();
+    parent
+        .ingest_batch(
+            &parent_vectors.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &[0, 1, 2],
+            None,
+        )
+        .unwrap();
+    parent.freeze().unwrap();
+
+    let mut child = parent.branch(&child_path).unwrap();
+    let child_edit = vec![0.0, 0.0, 0.0, 1.0];
+    child
+        .ingest_batch(&[child_edit.as_slice()], &[3], None)
+        .unwrap();
+    let delete = child.delete(&[1]).unwrap();
+    assert_eq!(
+        delete.deleted, 1,
+        "deleting an inherited vector must report it as deleted"
+    );
+    child.close().unwrap();
+    parent.close().unwrap();
+
+    let relocated = dir.path().join("relocated");
+    std::fs::rename(&bundle, &relocated).unwrap();
+    let relocated_child = relocated.join("child.rvf");
+    let reopened = RvfStore::open_readonly(&relocated_child).unwrap();
+    assert!(reopened.is_cow_child());
+    assert_eq!(
+        reopened.parent_path(),
+        Some(relocated.join("parent.rvf").as_path())
+    );
+
+    let hits = reopened
+        .query(&parent_vectors[0], 4, &QueryOptions::default())
+        .unwrap();
+    assert_eq!(hits[0].id, 0, "inherited parent vector must survive reopen");
+    let hits = reopened
+        .query(&child_edit, 4, &QueryOptions::default())
+        .unwrap();
+    assert_eq!(hits[0].id, 3, "child edit must survive reopen");
+    let hits = reopened
+        .query(&parent_vectors[1], 4, &QueryOptions::default())
+        .unwrap();
+    assert!(
+        hits.iter().all(|hit| hit.id != 1),
+        "child tombstone must hide inherited vector after reopen"
+    );
+    reopened.close().unwrap();
+}
+
+// ===========================================================================
+// TEST 11: missing_parent_fails_closed
+// ===========================================================================
+
+#[test]
+fn missing_parent_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let parent_path = dir.path().join("parent.rvf");
+    let child_path = dir.path().join("child.rvf");
+    let missing_path = dir.path().join("parent.missing");
+
+    let mut parent = RvfStore::create(&parent_path, make_options(4)).unwrap();
+    let vector = vec![1.0, 0.0, 0.0, 0.0];
+    parent
+        .ingest_batch(&[vector.as_slice()], &[0], None)
+        .unwrap();
+    parent.freeze().unwrap();
+    let child = parent.branch(&child_path).unwrap();
+    child.close().unwrap();
+    parent.close().unwrap();
+    std::fs::rename(&parent_path, &missing_path).unwrap();
+
+    assert!(
+        RvfStore::open_readonly(&child_path).is_err(),
+        "a COW child must not silently open without its validated parent"
+    );
+}
+
+// ===========================================================================
+// TEST 12: cyclic_parent_chain_fails_closed
+// ===========================================================================
+
+#[test]
+fn cyclic_parent_chain_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let root_path = dir.path().join("root.rvf");
+    let child_path = dir.path().join("child.rvf");
+    let grandchild_path = dir.path().join("grandchild.rvf");
+    let saved_root_path = dir.path().join("root.saved");
+
+    let mut root = RvfStore::create(&root_path, make_options(4)).unwrap();
+    let vector = vec![1.0, 0.0, 0.0, 0.0];
+    root.ingest_batch(&[vector.as_slice()], &[0], None).unwrap();
+    root.freeze().unwrap();
+
+    let mut child = root.branch(&child_path).unwrap();
+    child.freeze().unwrap();
+    let grandchild = child.branch(&grandchild_path).unwrap();
+    grandchild.close().unwrap();
+    child.close().unwrap();
+    root.close().unwrap();
+
+    // child -> root, while grandchild -> child. Put the grandchild bytes at
+    // root's path to form child -> grandchild -> child without modifying or
+    // re-checksumming either file.
+    std::fs::rename(&root_path, &saved_root_path).unwrap();
+    std::fs::rename(&grandchild_path, &root_path).unwrap();
+
+    assert!(matches!(
+        RvfStore::open_readonly(&child_path),
+        Err(rvf_types::RvfError::Code(
+            rvf_types::ErrorCode::LineageCyclic
+        ))
+    ));
 }

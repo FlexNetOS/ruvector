@@ -50,6 +50,12 @@ var RvfErrorCode;
     RvfErrorCode[RvfErrorCode["BackendNotFound"] = 65280] = "BackendNotFound";
     RvfErrorCode[RvfErrorCode["BackendInitFailed"] = 65281] = "BackendInitFailed";
     RvfErrorCode[RvfErrorCode["StoreClosed"] = 65282] = "StoreClosed";
+    RvfErrorCode[RvfErrorCode["InvalidOptions"] = 65283] = "InvalidOptions";
+    RvfErrorCode[RvfErrorCode["MetadataNotSupported"] = 65284] = "MetadataNotSupported";
+    RvfErrorCode[RvfErrorCode["InvalidArgument"] = 65285] = "InvalidArgument";
+    RvfErrorCode[RvfErrorCode["SidecarWriteFailed"] = 65286] = "SidecarWriteFailed";
+    RvfErrorCode[RvfErrorCode["SidecarCorrupt"] = 65287] = "SidecarCorrupt";
+    RvfErrorCode[RvfErrorCode["FileExists"] = 65288] = "FileExists";
 })(RvfErrorCode || (exports.RvfErrorCode = RvfErrorCode = {}));
 /** Human-readable labels for each error code. */
 const ERROR_MESSAGES = {
@@ -88,6 +94,13 @@ const ERROR_MESSAGES = {
     [RvfErrorCode.BackendNotFound]: 'No suitable backend found (install @ruvector/rvf-node or @ruvector/rvf-wasm)',
     [RvfErrorCode.BackendInitFailed]: 'Backend initialization failed',
     [RvfErrorCode.StoreClosed]: 'Store has been closed',
+    [RvfErrorCode.InvalidOptions]: 'Invalid store creation options',
+    [RvfErrorCode.MetadataNotSupported]: 'Per-vector metadata is not yet supported by this SDK (see issue #704) — ' +
+        'ingest without a metadata field, or wait for durable metadata support',
+    [RvfErrorCode.InvalidArgument]: 'Invalid argument',
+    [RvfErrorCode.SidecarWriteFailed]: 'Failed to persist the string-id map sidecar',
+    [RvfErrorCode.SidecarCorrupt]: 'The string-id map sidecar is missing fields or corrupt',
+    [RvfErrorCode.FileExists]: 'A file already exists at the target path',
 };
 /**
  * Custom error class for all RVF operations.
